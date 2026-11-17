@@ -1,6 +1,6 @@
 import { history, redo, undo } from 'prosemirror-history';
 import { Fragment, Node, Schema } from 'prosemirror-model';
-import { EditorState, Plugin, TextSelection } from 'prosemirror-state';
+import { EditorState, Plugin, Selection, TextSelection } from 'prosemirror-state';
 import {
   initProseMirrorDoc,
   redo as redoYjs,
@@ -15,7 +15,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Decoration, DecorationSet, EditorView, __findVirtualRange } from '../src/index.js';
 import { DEFAULT_TABLE_ROW_HEIGHT } from '../src/virtualize/constants.js';
 import { calibrateNodeHeight, estimateAccuracyReport, estimateNodeHeight } from '../src/virtualize/heights.js';
-import { materializeVirtualDescs } from '../src/virtualize/materialize.js';
+import { dematerializeRealDescs, materializeVirtualDescs } from '../src/virtualize/materialize.js';
 
 const schema = new Schema({
   nodes: {
@@ -405,6 +405,91 @@ describe('top-level virtualization', () => {
 
     view.destroy();
     place.remove();
+  });
+
+  it('restores the model selection after a placeholder swap', () => {
+    const { doc, place, view } = makeView();
+    const modelPos = 1;
+    view.dispatch(view.state.tr.setSelection(TextSelection.create(doc, modelPos)));
+    view.focus();
+    view.hasFocus = () => true;
+
+    const state = view._virtualization;
+    const virtualDesc = state.topLevelDescs.find(desc => desc && desc.virtual);
+    const realDescs = state.topLevelDescs.filter(desc => desc && !desc.virtual);
+    expect(virtualDesc).toBeTruthy();
+    expect(realDescs.length).toBeGreaterThan(1);
+
+    // Leave a stale DOM selection in another materialized block. The swap must
+    // restore the current model selection rather than keeping this old DOM one.
+    // The observer is stopped while planting, mirroring a swap inside a render
+    // pass: a live selectionchange would otherwise pull the model selection to
+    // the planted DOM one before the swap ever runs.
+    view.domObserver.stop();
+    const staleText = realDescs[1].dom.firstChild;
+    const selection = view.domSelection();
+    const range = document.createRange();
+    range.setStart(staleText, 0);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    view.domObserver.start();
+    expect(view.posAtDOM(selection.anchorNode, selection.anchorOffset)).not.toBe(modelPos);
+
+    materializeVirtualDescs(view, [virtualDesc]);
+
+    const restored = view.domSelection();
+    expect(view.posAtDOM(restored.anchorNode, restored.anchorOffset)).toBe(modelPos);
+
+    view.destroy();
+    place.remove();
+  });
+
+  it('maps a placeholder hit to its block start without materializing it', () => {
+    const { place, view } = makeView();
+    const state = view._virtualization;
+    const virtualDesc = state.topLevelDescs.find(desc => desc && desc.virtual);
+    const realDesc = state.topLevelDescs.find(desc => desc && !desc.virtual);
+    expect(virtualDesc).toBeTruthy();
+    expect(realDesc).toBeTruthy();
+
+    const elementFromPoint = Object.getOwnPropertyDescriptor(document, 'elementFromPoint');
+    const caretPositionFromPoint = Object.getOwnPropertyDescriptor(document, 'caretPositionFromPoint');
+    const caretRangeFromPoint = Object.getOwnPropertyDescriptor(document, 'caretRangeFromPoint');
+    try {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: () => realDesc.dom,
+      });
+      Object.defineProperty(document, 'caretPositionFromPoint', { configurable: true, value: undefined });
+      Object.defineProperty(document, 'caretRangeFromPoint', { configurable: true, value: undefined });
+
+      const realHit = view.posAtCoords({ left: 0, top: 0 });
+      expect(realHit).not.toBeNull();
+
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: () => virtualDesc.dom,
+      });
+      const expectedPos = Selection.near(view.state.doc.resolve(virtualDesc.posAtStart), 1).from;
+      const expectedInside = virtualDesc.posBefore;
+      const placeholderHit = view.posAtCoords({ left: 0, top: 0 });
+
+      expect(placeholderHit).toEqual({ pos: expectedPos, inside: expectedInside });
+      expect(state.topLevelDescs[virtualDesc.topLevelIndex]).toBe(virtualDesc);
+    }
+    finally {
+      for (const [name, descriptor] of [
+        ['elementFromPoint', elementFromPoint],
+        ['caretPositionFromPoint', caretPositionFromPoint],
+        ['caretRangeFromPoint', caretRangeFromPoint],
+      ]) {
+        if (descriptor) Object.defineProperty(document, name, descriptor);
+        else delete document[name];
+      }
+      view.destroy();
+      place.remove();
+    }
   });
 
   it('round-trips a position through a materialized virtual block', () => {
@@ -1406,6 +1491,30 @@ describe('top-level virtualization', () => {
       view.destroy();
       place.remove();
     });
+  });
+
+  it('does not swap blocks when the document is below the virtualization threshold', () => {
+    const doc = makeDoc(1);
+    const { place, view } = makeViewFromDoc(doc, undefined, { threshold: 1, overscanPx: 0 });
+    const realDesc = view.docView.children[0];
+    const staleState = {
+      calibration: new Map(),
+      estimates: new WeakMap(),
+      heights: new WeakMap(),
+      heightAdjustments: new WeakMap(),
+      range: { start: 1, end: 2 },
+      topLevelDescs: [realDesc],
+    };
+    view._virtualization = staleState;
+
+    expect(doc.childCount).toBeLessThanOrEqual(view.props.virtualizeTopLevel.threshold);
+    expect(dematerializeRealDescs(view, staleState)).toBe(0);
+    expect(view.docView.children[0]).toBe(realDesc);
+    expect(view.dom.children[0].dataset.pmVirtual).not.toBe('true');
+
+    view._virtualization = null;
+    view.destroy();
+    place.remove();
   });
 
   it('estimates placeholder heights by node type', () => {

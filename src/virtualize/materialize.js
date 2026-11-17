@@ -7,7 +7,7 @@ import {
 import { createVirtualDOM } from './placeholders.js';
 import { createNodeDesc, createVirtualDesc } from './descs.js';
 import { forkRuntime } from './runtime.js';
-import { topLevelDescAtIndex, topLevelIndexAtPos } from './state.js';
+import { topLevelDescAtIndex, topLevelIndexAtPos, virtualOptions } from './state.js';
 import { captureVirtualAnchor, restoreVirtualAnchor, virtualFlowHeight } from './viewport.js';
 
 function selectionTopLevelIndexes(view) {
@@ -49,7 +49,36 @@ export function hasStaleRealDescs(view, state, options) {
     return staleRealDescs(view, state, options).length > 0;
 }
 
+// Re-derive the DOM selection from the model after a swap rebuilt the DOM.
+// selectionToDOM writes through Selection.collapse, which some environments
+// (happy-dom) silently no-op; verify the write and fall back to a plain
+// range set, which leaves real browsers (where collapse works) untouched.
+function restoreModelSelection(view) {
+    forkRuntime.selectionToDOM(view);
+    if (view.isDestroyed) return;
+    let sel = view.state.selection;
+    let anchorDOM = view.docView.domFromPos(sel.anchor, sel.anchor ? -1 : 1);
+    let headDOM = sel.head == sel.anchor ? anchorDOM : view.docView.domFromPos(sel.head, sel.head ? -1 : 1);
+    let domSel = view.domSelectionRange();
+    if (!domSel ||
+        (domSel.anchorNode === anchorDOM.node && domSel.anchorOffset === anchorDOM.offset &&
+         domSel.focusNode === headDOM.node && domSel.focusOffset === headDOM.offset))
+        return;
+    let range = view.dom.ownerDocument.createRange();
+    let from = anchorDOM, to = headDOM;
+    if (sel.anchor > sel.head) { from = headDOM; to = anchorDOM; }
+    range.setEnd(to.node, to.offset);
+    range.setStart(from.node, from.offset);
+    domSel.removeAllRanges();
+    domSel.addRange(range);
+}
+
 export function dematerializeRealDescs(view, state, options) {
+    // A direct caller can hand in a state from a doc that no longer
+    // qualifies: never swap on a document below the threshold.
+    let config = virtualOptions(view);
+    if (!config || view.state.doc.childCount <= config.threshold)
+        return 0;
     let parent = view.docView;
     if (!parent || !parent.children || !state.range)
         return 0;
@@ -97,6 +126,10 @@ export function dematerializeRealDescs(view, state, options) {
     }
     if (anchor)
         restoreVirtualAnchor(view, anchor);
+    // The swap rebuilt the DOM around blocks that may have held the caret;
+    // re-derive it from the model instead of leaving a stale DOM selection.
+    forkRuntime.selectionToDOM(view);
+    restoreModelSelection(view);
     return changed;
 }
 
@@ -260,6 +293,9 @@ export function materializeVirtualDescs(view, descs, options) {
     // The anchor is restored before the compensation writes: the restore
     // reads the layout, and a style write would force another layout pass.
     if (anchor) restoreVirtualAnchor(view, anchor);
+    // Same rule as dematerialize: the swap may have rebuilt the DOM around
+    // the caret, so re-derive the selection from the model.
+    restoreModelSelection(view);
     // The compensation keeps the document height stable, so the scroll
     // position does not have to be read back from the DOM.
     if (delta)

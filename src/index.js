@@ -514,6 +514,18 @@ function posAtCoords(view, coords) {
         else if (offset == 0 || node.nodeType != 1 || node.childNodes[offset - 1].nodeName != "BR")
             pos = posFromCaret(view, node, offset, coords);
     }
+    // fork hook (virtualization): a placeholder hit has no editable text
+    // position; resolve to the block's start without materializing it.
+    // The identity find only runs for pointer work over placeholders.
+    let virtualElt = elt && elt.closest && elt.closest('[data-pm-virtual]');
+    if (virtualElt) {
+        let vstate = view._virtualization;
+        let vdesc = vstate && Array.isArray(vstate.topLevelDescs) &&
+            vstate.topLevelDescs.find((d) => d && d.virtual && d.dom === virtualElt);
+        if (vdesc)
+            return { pos: Selection.near(view.state.doc.resolve(vdesc.posAtStart), 1).from,
+                     inside: vdesc.posBefore };
+    }
     if (pos == null)
         pos = posFromElement(view, elt, coords);
     let desc = view.docView.nearestDesc(elt, true);
