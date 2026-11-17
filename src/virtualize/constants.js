@@ -8,6 +8,8 @@ export const DEFAULT_AVG_CHAR_WIDTH = 8.5;
 export const DEFAULT_TABLE_AVG_CHAR_WIDTH = 7;
 export const DEFAULT_TABLE_CELL_PADDING = 22;
 export const DEFAULT_TABLE_LINE_HEIGHT = 25.56;
+// Replaced by the first measured table; short-cell tables cannot infer row height from column capacity.
+export const DEFAULT_TABLE_ROW_HEIGHT = 98;
 export const DEFAULT_LIST_MARGIN = 21.3;
 export const DEFAULT_LIST_ITEM_MARGIN = 8.52;
 export const DEFAULT_CODE_LINE_HEIGHT = 25.56;

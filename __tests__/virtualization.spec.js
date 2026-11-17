@@ -13,6 +13,7 @@ import {
 import * as Y from 'yjs';
 import { describe, expect, it, vi } from 'vitest';
 import { Decoration, DecorationSet, EditorView, __findVirtualRange } from '../src/index.js';
+import { calibrateNodeHeight, estimateNodeHeight } from '../src/virtualize/heights.js';
 
 const schema = new Schema({
   nodes: {
@@ -77,6 +78,48 @@ function makeTable(rows = 6, columns = 3, textLength = 110) {
     rowNodes.push(schema.nodes.tableRow.create(null, cells));
   }
   return schema.nodes.table.create(null, rowNodes);
+}
+
+function makeMeasuredTableFixture(node, cellHeight) {
+  const dom = document.createElement('table');
+  for (let rowIndex = 0; rowIndex < node.childCount; rowIndex++) {
+    const row = document.createElement('tr');
+    const modelRow = node.child(rowIndex);
+    for (let column = 0; column < modelRow.childCount; column++) {
+      const cell = document.createElement('td');
+      cell.textContent = modelRow.child(column).textContent;
+      cell.getBoundingClientRect = () => ({ height: cellHeight });
+      row.appendChild(cell);
+    }
+    dom.appendChild(row);
+  }
+  dom.getBoundingClientRect = () => ({ height: cellHeight * node.childCount });
+  const state = { calibration: new Map(), topLevelDescs: null, width: 800 };
+  const view = { _virtualization: state, dom: { clientWidth: 800 } };
+  return { dom, state, view };
+}
+
+function mockTableCellStyles() {
+  const originalStyle = window.getComputedStyle;
+  window.getComputedStyle = element => {
+    const style = originalStyle.call(window, element);
+    if (element.tagName != 'TD') return style;
+    const overrides = {
+      lineHeight: '25.56px',
+      paddingTop: '10px',
+      paddingBottom: '10px',
+      borderTopWidth: '1px',
+      borderBottomWidth: '1px',
+    };
+    return new Proxy(style, {
+      get(target, property) {
+        if (property in overrides) return overrides[property];
+        const value = target[property];
+        return typeof value == 'function' ? value.bind(target) : value;
+      },
+    });
+  };
+  return () => { window.getComputedStyle = originalStyle; };
 }
 
 function makeList(items = 2, textLength = 110) {
@@ -1762,112 +1805,62 @@ describe('top-level virtualization', () => {
     }
   });
 
-  it('calibrates short table cells from their measured line count', async () => {
-    const originalRect = HTMLElement.prototype.getBoundingClientRect;
-    const originalStyle = window.getComputedStyle;
-    const scroller = document.createElement('div');
-    scroller.style.overflowY = 'auto';
-    scroller.style.height = '100px';
-    document.body.appendChild(scroller);
-    const place = document.createElement('div');
-    scroller.appendChild(place);
+  it('uses measured table row height when short cells cannot calibrate a column', () => {
     const tableRows = 4;
-    const tableColumns = 2;
     const cellHeight = 73.12;
-    const tableHeight = cellHeight * tableRows;
-    const trueHeight = tableHeight * 100;
-    const makeShortTable = () => {
-      const rows = [];
-      for (let row = 0; row < tableRows; row++) {
-        const cells = [];
-        for (let column = 0; column < tableColumns; column++) {
-          cells.push(schema.nodes.tableCell.create(null,
-            schema.text(`r${row}c${column}`)));
-        }
-        rows.push(schema.nodes.tableRow.create(null, cells));
-      }
-      return schema.nodes.table.create(null, rows);
-    };
-    const doc = schema.nodes.doc.create(null,
-      Array.from({ length: 100 }, () => makeShortTable()));
-    const ydoc = new Y.Doc();
-    const yfrag = ydoc.getXmlFragment('content');
-    updateYFragment(ydoc, yfrag, doc, { mapping: new Map(), isOMark: new Map() });
-    const { doc: boundDoc, mapping } = initProseMirrorDoc(yfrag, schema);
-    const view = new EditorView(place, {
-      state: EditorState.create({
-        doc: boundDoc,
-        plugins: [ySyncPlugin(yfrag, { mapping })],
-      }),
-      virtualizeTopLevel: { threshold: 10, overscanPx: 200 },
-    });
-
-    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 100 });
-    Object.defineProperty(scroller, 'scrollHeight', {
-      configurable: true,
-      get() {
-        let height = 0;
-        for (const child of view.dom.children) {
-          height += child.tagName == 'TABLE'
-            ? tableHeight
-            : Number.parseFloat(child.style.height) || 0;
-        }
-        return height;
-      },
-    });
-    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
-      if (this === scroller) {
-        return { top: 0, bottom: 100, left: 0, right: 800, width: 800, height: 100 };
-      }
-      if (this === view.dom) {
-        return { top: 0, bottom: 100, left: 0, right: 800, width: 800, height: 100 };
-      }
-      if (this.tagName == 'TD') {
-        return { top: 0, bottom: cellHeight, left: 0, right: 20, width: 20, height: cellHeight };
-      }
-      if (this.tagName == 'TR') {
-        return { top: 0, bottom: cellHeight, left: 0, right: 40, width: 40, height: cellHeight };
-      }
-      if (this.tagName == 'TABLE') {
-        return { top: 0, bottom: tableHeight, left: 0, right: 40, width: 40, height: tableHeight };
-      }
-      return originalRect.call(this);
-    };
-    window.getComputedStyle = element => {
-      const style = originalStyle.call(window, element);
-      if (element.tagName != 'TD') return style;
-      const overrides = {
-        lineHeight: '25.56px',
-        paddingTop: '10px',
-        paddingBottom: '10px',
-        borderTopWidth: '1px',
-        borderBottomWidth: '1px',
-      };
-      return new Proxy(style, {
-        get(target, property) {
-          if (property in overrides) return overrides[property];
-          const value = target[property];
-          return typeof value == 'function' ? value.bind(target) : value;
-        },
-      });
-    };
+    const rows = [];
+    for (let row = 0; row < tableRows; row++) {
+      rows.push(schema.nodes.tableRow.create(null, [
+        schema.nodes.tableCell.create(null, schema.text(`r${row}c0`)),
+        schema.nodes.tableCell.create(null, schema.text(`r${row}c1`)),
+      ]));
+    }
+    const table = schema.nodes.table.create(null, rows);
+    const { dom, state, view } = makeMeasuredTableFixture(table, cellHeight);
+    const restoreStyles = mockTableCellStyles();
 
     try {
-      await new Promise(resolve => requestAnimationFrame(resolve));
-      const calibration = view._virtualization.calibration.get('table');
+      calibrateNodeHeight(view, { node: table, dom, virtual: false });
+      const calibration = state.calibration.get('table');
       expect(calibration).toBeTruthy();
-      // Four characters wrap onto two measured lines, so the column holds two
-      // characters per line even though the text is shorter than the old gate.
-      expect(calibration.columnChars).toEqual([2, 2]);
-      expect(Math.abs(scroller.scrollHeight - trueHeight) / trueHeight).toBeLessThan(0.03);
+      expect(calibration.columnChars).toEqual([]);
+      expect(calibration.rowHeight).toBeCloseTo(cellHeight);
+      const estimated = estimateNodeHeight(view, table);
+      const expected = tableRows * cellHeight;
+      expect(Math.abs(estimated - expected) / expected).toBeLessThan(0.1);
     }
     finally {
-      view.destroy();
-      place.remove();
-      scroller.remove();
-      HTMLElement.prototype.getBoundingClientRect = originalRect;
-      window.getComputedStyle = originalStyle;
-      ydoc.destroy();
+      restoreStyles();
+    }
+  });
+
+  it('keeps wrapping table cells calibrated without exploding estimates', () => {
+    const tableRows = 4;
+    const cellHeight = 98;
+    const rows = [];
+    for (let row = 0; row < tableRows; row++) {
+      rows.push(schema.nodes.tableRow.create(null, [
+        schema.nodes.tableCell.create(null, schema.text('x'.repeat(60))),
+        schema.nodes.tableCell.create(null, schema.text(`r${row}c1`)),
+      ]));
+    }
+    const table = schema.nodes.table.create(null, rows);
+    const { dom, state, view } = makeMeasuredTableFixture(table, cellHeight);
+    const restoreStyles = mockTableCellStyles();
+
+    try {
+      calibrateNodeHeight(view, { node: table, dom, virtual: false });
+      const calibration = state.calibration.get('table');
+      expect(calibration).toBeTruthy();
+      expect(calibration.columnChars[0]).toBeGreaterThan(0);
+      expect(calibration.columnChars[1] || 0).toBe(0);
+      const estimated = estimateNodeHeight(view, table);
+      const fallback = tableRows * cellHeight;
+      expect(estimated).toBeGreaterThan(fallback / 2);
+      expect(estimated).toBeLessThan(fallback * 2);
+    }
+    finally {
+      restoreStyles();
     }
   });
 

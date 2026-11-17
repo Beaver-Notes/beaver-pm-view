@@ -13,6 +13,7 @@ import {
     DEFAULT_TABLE_AVG_CHAR_WIDTH,
     DEFAULT_TABLE_CELL_PADDING,
     DEFAULT_TABLE_LINE_HEIGHT,
+    DEFAULT_TABLE_ROW_HEIGHT,
     DEFAULT_VIRTUAL_HEIGHT,
     MIN_CALIBRATION_TEXT_LENGTH,
 } from './constants.js';
@@ -73,6 +74,9 @@ export function estimateNodeHeight(view, node) {
         let lineHeight = calibration && calibration.cellLineHeight || DEFAULT_TABLE_LINE_HEIGHT;
         let padding = calibration && calibration.cellPadding != null ? calibration.cellPadding : DEFAULT_TABLE_CELL_PADDING;
         let columnChars = calibration && calibration.columnChars;
+        let rowHeight = calibration && calibration.rowHeight || DEFAULT_TABLE_ROW_HEIGHT;
+        if (!columnChars || !columnChars.some(chars => chars > 0))
+            return rows * rowHeight;
         let height = 0;
         for (let rowIndex = 0; rowIndex < rows; rowIndex++) {
             let row = node.child(rowIndex), lines = 1;
@@ -169,7 +173,7 @@ export function calibrateNodeHeight(view, desc) {
                     continue;
                 let lines = Math.max(1, Math.ceil((cellHeight - cellPadding) / cellLineHeight - .05));
                 let cellTextLength = (cell.textContent || '').trim().length;
-                let chars = cellTextLength ? cellTextLength / lines : 0;
+                let chars = cellTextLength >= MIN_CALIBRATION_TEXT_LENGTH ? cellTextLength / lines : 0;
                 if (chars) {
                     columnChars[column] = (columnChars[column] || 0) + chars;
                     columnSamples[column] = (columnSamples[column] || 0) + 1;
@@ -183,10 +187,14 @@ export function calibrateNodeHeight(view, desc) {
             return;
         for (let column = 0; column < columnChars.length; column++)
             columnChars[column] = columnSamples[column] ? columnChars[column] / columnSamples[column] : 0;
+        // Flow height includes one collapsed margin; remove it before splitting the border box across rows.
+        let measuredTableHeight = height + margin;
+        let rowHeight = rows.length ? (measuredTableHeight - margin) / rows.length : 0;
         state.calibration.set(key, {
             cellLineHeight: lineHeightTotal / samples,
             cellPadding: paddingTotal / samples,
             columnChars,
+            rowHeight,
             marginTop,
             marginBottom,
             margin,
