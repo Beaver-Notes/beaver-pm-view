@@ -8,8 +8,11 @@ export const DEFAULT_AVG_CHAR_WIDTH = 8.5;
 export const DEFAULT_TABLE_AVG_CHAR_WIDTH = 7;
 export const DEFAULT_TABLE_CELL_PADDING = 22;
 export const DEFAULT_TABLE_LINE_HEIGHT = 25.56;
-// Replaced by the first measured table; short-cell tables cannot infer row height from column capacity.
+// Used until at least three measured table row samples provide a robust median.
 export const DEFAULT_TABLE_ROW_HEIGHT = 98;
+export const TABLE_ROW_SAMPLE_LIMIT = 20;
+export const MIN_TABLE_ROW_HEIGHT = 30;
+export const MAX_TABLE_ROW_HEIGHT = 600;
 export const DEFAULT_LIST_MARGIN = 21.3;
 export const DEFAULT_LIST_ITEM_MARGIN = 8.52;
 export const DEFAULT_CODE_LINE_HEIGHT = 25.56;

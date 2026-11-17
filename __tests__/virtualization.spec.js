@@ -13,6 +13,7 @@ import {
 import * as Y from 'yjs';
 import { describe, expect, it, vi } from 'vitest';
 import { Decoration, DecorationSet, EditorView, __findVirtualRange } from '../src/index.js';
+import { DEFAULT_TABLE_ROW_HEIGHT } from '../src/virtualize/constants.js';
 import { calibrateNodeHeight, estimateNodeHeight } from '../src/virtualize/heights.js';
 
 const schema = new Schema({
@@ -80,7 +81,13 @@ function makeTable(rows = 6, columns = 3, textLength = 110) {
   return schema.nodes.table.create(null, rowNodes);
 }
 
-function makeMeasuredTableFixture(node, cellHeight) {
+function makeMeasuredTableFixture(node, cellHeight, state = {
+  calibration: new Map(),
+  heights: new WeakMap(),
+  tableRowSamples: [],
+  topLevelDescs: null,
+  width: 800,
+}) {
   const dom = document.createElement('table');
   for (let rowIndex = 0; rowIndex < node.childCount; rowIndex++) {
     const row = document.createElement('tr');
@@ -94,7 +101,6 @@ function makeMeasuredTableFixture(node, cellHeight) {
     dom.appendChild(row);
   }
   dom.getBoundingClientRect = () => ({ height: cellHeight * node.childCount });
-  const state = { calibration: new Map(), topLevelDescs: null, width: 800 };
   const view = { _virtualization: state, dom: { clientWidth: 800 } };
   return { dom, state, view };
 }
@@ -1805,7 +1811,7 @@ describe('top-level virtualization', () => {
     }
   });
 
-  it('uses measured table row height when short cells cannot calibrate a column', () => {
+  it('uses the default table row height until enough row samples exist', () => {
     const tableRows = 4;
     const cellHeight = 73.12;
     const rows = [];
@@ -1824,10 +1830,62 @@ describe('top-level virtualization', () => {
       const calibration = state.calibration.get('table');
       expect(calibration).toBeTruthy();
       expect(calibration.columnChars).toEqual([]);
-      expect(calibration.rowHeight).toBeCloseTo(cellHeight);
+      expect(calibration.rowHeight).toBeCloseTo(DEFAULT_TABLE_ROW_HEIGHT);
       const estimated = estimateNodeHeight(view, table);
-      const expected = tableRows * cellHeight;
+      const expected = tableRows * DEFAULT_TABLE_ROW_HEIGHT;
       expect(Math.abs(estimated - expected) / expected).toBeLessThan(0.1);
+    }
+    finally {
+      restoreStyles();
+    }
+  });
+
+  it('uses the median table row height when the first measured table is an outlier', () => {
+    const table = makeTable(6, 3, 1);
+    const first = makeMeasuredTableFixture(table, 149.03);
+    const restoreStyles = mockTableCellStyles();
+
+    try {
+      calibrateNodeHeight(first.view, { node: table, dom: first.dom, virtual: false });
+      for (let sample = 0; sample < 3; sample++) {
+        const fixture = makeMeasuredTableFixture(table, 98, first.state);
+        calibrateNodeHeight(fixture.view, { node: table, dom: fixture.dom, virtual: false });
+      }
+
+      const calibration = first.state.calibration.get('table');
+      const estimated = estimateNodeHeight(first.view, makeTable(6, 3, 1));
+      const expected = 6 * 98;
+      expect(Math.abs(estimated - expected) / expected).toBeLessThan(0.1);
+      expect(calibration.rowHeight).toBeCloseTo(98);
+      expect(first.state.tableRowSamples).toHaveLength(4);
+    }
+    finally {
+      restoreStyles();
+    }
+  });
+
+  it('caps table row samples and clamps pathological row heights', () => {
+    const table = makeTable(6, 3, 1);
+    const first = makeMeasuredTableFixture(table, 98);
+    const restoreStyles = mockTableCellStyles();
+
+    try {
+      calibrateNodeHeight(first.view, { node: table, dom: first.dom, virtual: false });
+      for (let sample = 1; sample < 25; sample++) {
+        const fixture = makeMeasuredTableFixture(table, 98, first.state);
+        calibrateNodeHeight(fixture.view, { node: table, dom: fixture.dom, virtual: false });
+      }
+
+      const high = makeMeasuredTableFixture(table, 700, first.state);
+      calibrateNodeHeight(high.view, { node: table, dom: high.dom, virtual: false });
+      expect(first.state.tableRowSamples).toHaveLength(20);
+      expect(first.state.tableRowSamples[19]).toBe(600);
+
+      const low = makeMeasuredTableFixture(table, 10, first.state);
+      calibrateNodeHeight(low.view, { node: table, dom: low.dom, virtual: false });
+      expect(first.state.tableRowSamples).toHaveLength(20);
+      expect(first.state.tableRowSamples[19]).toBe(30);
+      expect(first.state.tableRowSamples.every(sample => sample >= 30 && sample <= 600)).toBe(true);
     }
     finally {
       restoreStyles();

@@ -76,6 +76,7 @@ export function ensureVirtualization(view) {
             heightAdjustments: new WeakMap(),
             topLevelDescs: [],
             calibration: new Map(),
+            tableRowSamples: [],
             width: view.dom.clientWidth || DEFAULT_CONTENT_WIDTH,
             range: null,
             activationPending: deferActivation,

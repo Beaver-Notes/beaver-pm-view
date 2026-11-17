@@ -15,7 +15,10 @@ import {
     DEFAULT_TABLE_LINE_HEIGHT,
     DEFAULT_TABLE_ROW_HEIGHT,
     DEFAULT_VIRTUAL_HEIGHT,
+    MAX_TABLE_ROW_HEIGHT,
     MIN_CALIBRATION_TEXT_LENGTH,
+    MIN_TABLE_ROW_HEIGHT,
+    TABLE_ROW_SAMPLE_LIMIT,
 } from './constants.js';
 
 export function virtualCalibrationKey(node) {
@@ -44,6 +47,18 @@ function estimatedLineCount(length, charsPerLine) {
 
 function calibratedHeight(state, key) {
     return state.calibration.get(key);
+}
+
+function updateTableRowHeight(state, measuredRowHeight) {
+    let samples = state.tableRowSamples || (state.tableRowSamples = []);
+    samples.push(Math.min(MAX_TABLE_ROW_HEIGHT, Math.max(MIN_TABLE_ROW_HEIGHT, measuredRowHeight)));
+    if (samples.length > TABLE_ROW_SAMPLE_LIMIT)
+        samples.shift();
+    if (samples.length < 3)
+        return DEFAULT_TABLE_ROW_HEIGHT;
+    let sorted = samples.slice().sort((a, b) => a - b);
+    let middle = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
 export function estimateNodeHeight(view, node) {
@@ -135,8 +150,28 @@ export function calibrateNodeHeight(view, desc) {
     if (!state || !node || !dom || dom.nodeType != 1 || desc.virtual)
         return;
     let key = virtualCalibrationKey(node);
-    if (state.calibration.has(key))
+    let calibration = state.calibration.get(key);
+    if (calibration) {
+        if (node.type.name != 'table')
+            return;
+        let rows = Array.from(dom.querySelectorAll('tr'));
+        if (!rows.length)
+            return;
+        let height = state.heights.get(node);
+        if (!(height > 0))
+            height = dom.getBoundingClientRect().height;
+        if (!(height > 0))
+            return;
+        let margin = calibration.margin || 0;
+        let measuredTableHeight = height + margin;
+        let measuredRowHeight = (measuredTableHeight - margin) / rows.length;
+        let rowHeight = updateTableRowHeight(state, measuredRowHeight);
+        if (rowHeight != calibration.rowHeight) {
+            calibration.rowHeight = rowHeight;
+            refreshVirtualEstimates(view, state, key);
+        }
         return;
+    }
     let height = dom.getBoundingClientRect().height;
     if (!(height > 0))
         return;
@@ -157,6 +192,9 @@ export function calibrateNodeHeight(view, desc) {
         let rows = Array.from(dom.querySelectorAll('tr'));
         if (!rows.length)
             return;
+        // Flow height includes one collapsed margin; remove it before splitting the border box across rows.
+        let measuredTableHeight = height + margin;
+        let measuredRowHeight = (measuredTableHeight - margin) / rows.length;
         let lineHeightTotal = 0, paddingTotal = 0, samples = 0;
         let columnChars = [], columnSamples = [];
         for (let row of rows) {
@@ -187,9 +225,7 @@ export function calibrateNodeHeight(view, desc) {
             return;
         for (let column = 0; column < columnChars.length; column++)
             columnChars[column] = columnSamples[column] ? columnChars[column] / columnSamples[column] : 0;
-        // Flow height includes one collapsed margin; remove it before splitting the border box across rows.
-        let measuredTableHeight = height + margin;
-        let rowHeight = rows.length ? (measuredTableHeight - margin) / rows.length : 0;
+        let rowHeight = updateTableRowHeight(state, measuredRowHeight);
         state.calibration.set(key, {
             cellLineHeight: lineHeightTotal / samples,
             cellPadding: paddingTotal / samples,
