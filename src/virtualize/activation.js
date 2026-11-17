@@ -1,5 +1,5 @@
-import { DEFAULT_CONTENT_WIDTH } from './constants.js';
-import { compensateVirtualHeight, dematerializeRealDescs, materializeVirtualDescs } from './materialize.js';
+import { DEFAULT_CONTENT_WIDTH, SCROLL_MATERIALIZATION_BUDGET_MS } from './constants.js';
+import { compensateVirtualHeight, dematerializeRealDescs, hasStaleRealDescs, materializeVirtualDescs } from './materialize.js';
 import { forkRuntime } from './runtime.js';
 import { topLevelDescAtIndex, topLevelIndexAtPos, virtualOptions } from './state.js';
 import {
@@ -20,6 +20,7 @@ export function destroyVirtualization(view) {
         return;
     if (state.scrollRaf != null)
         cancelAnimationFrame(state.scrollRaf);
+    state.scrollToken = null;
     if (state.activationRaf != null)
         cancelAnimationFrame(state.activationRaf);
     if (state.scrollTarget && state.scrollHandler)
@@ -30,16 +31,29 @@ export function destroyVirtualization(view) {
 function attachVirtualScroll(view, state) {
     let scroller = virtualScroller(view);
     state.scrollTarget = scroller.window || scroller.element;
-    state.scrollHandler = () => {
-        if (state.scrollRaf != null)
-            return;
-        state.scrollRaf = requestAnimationFrame(() => {
-            state.scrollRaf = null;
-            if (!view.isDestroyed)
-                activateVirtualization(view);
-        });
-    };
+    state.scrollHandler = () => scheduleVirtualScroll(view);
     state.scrollTarget.addEventListener('scroll', state.scrollHandler, { passive: true });
+}
+
+function scheduleVirtualScroll(view) {
+    let state = view._virtualization;
+    if (!state || state.scrollRaf != null)
+        return;
+    let token = state.scrollToken = {};
+    let raf = requestAnimationFrame(() => {
+        if (state.scrollToken !== token)
+            return;
+        state.scrollToken = null;
+        state.scrollRaf = null;
+        if (view.isDestroyed || view._virtualization !== state)
+            return;
+        if (materializeVisibleBlocksForScroll(view))
+            scheduleVirtualScroll(view);
+    });
+    // A synchronous requestAnimationFrame implementation runs the callback
+    // before it returns the id.
+    if (state.scrollToken === token)
+        state.scrollRaf = raf;
 }
 
 export function ensureVirtualization(view) {
@@ -67,6 +81,9 @@ export function ensureVirtualization(view) {
             activationPending: deferActivation,
             activationRaf: null,
             activationAttempts: 0,
+            scrollRaf: null,
+            scrollToken: null,
+            scrollCleanupPending: false,
             topLevelChanged: true,
         };
         state.range = virtualRangeForBuild(view, view.state.doc);
@@ -108,6 +125,91 @@ export function materializeSelectionBlocks(view, force = false) {
             descs.push(desc);
     }
     materializeVirtualDescs(view, descs);
+}
+
+function materializeVisibleBlocksForScroll(view) {
+    let state = ensureVirtualization(view);
+    if (!state || state.activationPending || !hasUsableLayout(view))
+        return false;
+    let visibleRange = findVirtualRange(view, 0);
+    let targetRange = findVirtualRange(view, state.options.overscanPx);
+    if (!targetRange || targetRange.end <= targetRange.start)
+        return false;
+
+    let hasPending = range => {
+        for (let index = range.start; index < range.end; index++) {
+            let desc = state.topLevelDescs[index];
+            if (desc && desc.virtual)
+                return true;
+        }
+        return false;
+    };
+    let pending = hasPending(targetRange);
+    let stale = hasStaleRealDescs(view, state, { keepSelection: true });
+
+    // Cleanup gets its own frame. Combining a cleanup batch with
+    // materialization would put both costs in the same callback.
+    if (state.scrollCleanupPending && stale) {
+        dematerializeRealDescs(view, state, { keepSelection: true });
+        state.scrollCleanupPending = false;
+        return pending;
+    }
+    if (!pending) {
+        if (stale)
+            dematerializeRealDescs(view, state, { keepSelection: true });
+        return false;
+    }
+
+    let candidates = [], seen = new Set;
+    let addIndex = index => {
+        let desc = state.topLevelDescs[index];
+        if (!desc || !desc.virtual || seen.has(index))
+            return;
+        seen.add(index);
+        candidates.push(desc);
+    };
+    // The visible slice comes first. Overscan blocks are only useful after
+    // the blocks the user can see are real. They then grow outwards from the
+    // visible slice, so the materialized range stays contiguous.
+    for (let index = visibleRange.start; index < visibleRange.end; index++)
+        addIndex(index);
+    for (let index = visibleRange.start - 1; index >= targetRange.start; index--)
+        addIndex(index);
+    for (let index = visibleRange.end; index < targetRange.end; index++)
+        addIndex(index);
+
+    let start = performance.now();
+    let deadline = start + SCROLL_MATERIALIZATION_BUDGET_MS;
+    let materialized = 0;
+    for (let desc of candidates) {
+        if (materialized && performance.now() >= deadline)
+            break;
+        if (!materializeVirtualDescs(view, [desc]).length)
+            continue;
+        materialized++;
+        if (performance.now() >= deadline)
+            break;
+    }
+
+    // The range describes the blocks that are real now. A pending overscan
+    // block must not make a structural edit materialize the whole target in
+    // one transaction.
+    let rangeStart = -1, rangeEnd = -1;
+    for (let index = targetRange.start; index < targetRange.end; index++) {
+        let desc = state.topLevelDescs[index];
+        if (!desc || desc.virtual)
+            continue;
+        if (rangeStart < 0) rangeStart = index;
+        rangeEnd = index + 1;
+    }
+    if (rangeStart >= 0)
+        state.range = { start: rangeStart, end: rangeEnd };
+    state.topLevelChanged = false;
+
+    pending = hasPending(targetRange);
+    stale = hasStaleRealDescs(view, state, { keepSelection: true });
+    state.scrollCleanupPending = stale;
+    return pending ? materialized > 0 || stale : stale;
 }
 
 export function materializeVisibleBlocks(view) {
@@ -158,9 +260,13 @@ export function activateVirtualization(view) {
         cancelAnimationFrame(state.activationRaf);
         state.activationRaf = null;
     }
-    let scrollHeightBefore = virtualScrollHeight(view);
     for (let desc of state.topLevelDescs)
         if (desc && !desc.virtual) calibrateNodeHeight(view, desc);
+    // Calibration can improve the estimates of the blocks that are still
+    // placeholders. The height before materialization is captured after that
+    // correction, so the estimate is not immediately taken back by the
+    // compensation below.
+    let scrollHeightBefore = virtualScrollHeight(view);
     let range = hasUsableLayout(view)
         ? findVirtualRange(view, state.options.overscanPx)
         : virtualRangeForDescs(view, state.topLevelDescs, state.options.overscanPx);

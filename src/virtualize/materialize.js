@@ -23,10 +23,10 @@ function selectionTopLevelIndexes(view) {
     return indexes;
 }
 
-export function dematerializeRealDescs(view, state, options) {
+function staleRealDescs(view, state, options) {
     let parent = view.docView;
     if (!parent || !parent.children || !state.range)
-        return 0;
+        return [];
     let keepSelection = options && options.keepSelection ? selectionTopLevelIndexes(view) : null;
     let stale = [];
     for (let index = 0; index < state.topLevelDescs.length; index++) {
@@ -42,6 +42,18 @@ export function dematerializeRealDescs(view, state, options) {
             continue;
         stale.push({ desc, docIndex });
     }
+    return stale;
+}
+
+export function hasStaleRealDescs(view, state, options) {
+    return staleRealDescs(view, state, options).length > 0;
+}
+
+export function dematerializeRealDescs(view, state, options) {
+    let parent = view.docView;
+    if (!parent || !parent.children || !state.range)
+        return 0;
+    let stale = staleRealDescs(view, state, options);
     if (!stale.length)
         return 0;
     // Plan the swap before touching the DOM: a measured block turns into a

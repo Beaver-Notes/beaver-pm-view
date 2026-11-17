@@ -169,7 +169,7 @@ export function calibrateNodeHeight(view, desc) {
                     continue;
                 let lines = Math.max(1, Math.ceil((cellHeight - cellPadding) / cellLineHeight - .05));
                 let cellTextLength = (cell.textContent || '').trim().length;
-                let chars = cellTextLength >= MIN_CALIBRATION_TEXT_LENGTH ? cellTextLength / lines : 0;
+                let chars = cellTextLength ? cellTextLength / lines : 0;
                 if (chars) {
                     columnChars[column] = (columnChars[column] || 0) + chars;
                     columnSamples[column] = (columnSamples[column] || 0) + 1;

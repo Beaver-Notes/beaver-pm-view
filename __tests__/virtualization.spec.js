@@ -341,6 +341,9 @@ describe('top-level virtualization', () => {
 
     try {
       expect(view._virtualization.scrollTarget).toBe(scroller);
+      // Compare the post-calibration height; cold calibration is allowed to
+      // correct the initial estimate before scrolling starts.
+      await new Promise(resolve => requestAnimationFrame(resolve));
       const beforeHeight = scroller.scrollHeight;
       const beforeReal = view.dom.children.length - view.dom.querySelectorAll('[data-pm-virtual="true"]').length;
 
@@ -1647,6 +1650,226 @@ describe('top-level virtualization', () => {
       HTMLElement.prototype.getBoundingClientRect = originalRect;
     }
   }, 60000);
+
+  it('keeps a large scroll materialization inside one frame budget', async () => {
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const originalRaf = globalThis.requestAnimationFrame;
+    const originalCancelRaf = globalThis.cancelAnimationFrame;
+    const scroller = document.createElement('div');
+    scroller.style.overflowY = 'auto';
+    scroller.style.height = '300px';
+    document.body.appendChild(scroller);
+    const place = document.createElement('div');
+    scroller.appendChild(place);
+    const doc = schema.nodes.doc.create(null,
+      Array.from({ length: 320 }, () => makeTable()));
+    const ydoc = new Y.Doc();
+    const yfrag = ydoc.getXmlFragment('content');
+    updateYFragment(ydoc, yfrag, doc, { mapping: new Map(), isOMark: new Map() });
+    const { doc: boundDoc, mapping } = initProseMirrorDoc(yfrag, schema);
+    const view = new EditorView(place, {
+      state: EditorState.create({
+        doc: boundDoc,
+        plugins: [ySyncPlugin(yfrag, { mapping })],
+      }),
+      virtualizeTopLevel: { threshold: 100, overscanPx: 200 },
+    });
+    let scrollTop = 0;
+    let delayMaterialization = false;
+    const delayedElements = new WeakSet();
+
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 300 });
+    Object.defineProperty(scroller, 'scrollHeight', {
+      configurable: true,
+      get: () => 100 * view.dom.children.length,
+    });
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: value => { scrollTop = value; },
+    });
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      if (this === scroller) {
+        return { top: 0, bottom: 300, left: 0, right: 800, width: 800, height: 300 };
+      }
+      if (this === view.dom) {
+        return { top: -scrollTop, bottom: 300 - scrollTop, left: 0, right: 800, width: 800, height: 300 };
+      }
+      const index = Array.prototype.indexOf.call(view.dom.children, this);
+      if (index < 0) return originalRect.call(this);
+      if (delayMaterialization && this.dataset.pmVirtual !== 'true' && !delayedElements.has(this)) {
+        delayedElements.add(this);
+        const start = performance.now();
+        while (performance.now() - start < 8) {}
+      }
+      const top = index * 100 - scrollTop;
+      return { top, bottom: top + 100, left: 0, right: 800, width: 800, height: 100 };
+    };
+
+    try {
+      await new Promise(resolve => originalRaf(resolve));
+      expect(view._virtualization.activationPending).toBe(false);
+      delayMaterialization = true;
+
+      const frames = [];
+      globalThis.requestAnimationFrame = callback => {
+        frames.push(callback);
+        return frames.length;
+      };
+      globalThis.cancelAnimationFrame = () => {};
+
+      scrollTop = 28000;
+      scroller.scrollTop = scrollTop;
+      scroller.dispatchEvent(new window.Event('scroll'));
+      expect(frames).toHaveLength(1);
+
+      const visibleRange = __findVirtualRange(view, 0);
+      const overscanRange = __findVirtualRange(view, 200);
+      expect(overscanRange.end - overscanRange.start).toBeGreaterThan(3);
+
+      const firstStart = performance.now();
+      frames.shift()(firstStart);
+      const firstElapsed = performance.now() - firstStart;
+      const state = view._virtualization;
+      const realInRange = () => state.topLevelDescs
+        .slice(overscanRange.start, overscanRange.end)
+        .filter(desc => desc && !desc.virtual).length;
+
+      expect(firstElapsed).toBeLessThan(20);
+      expect(realInRange()).toBeLessThan(overscanRange.end - overscanRange.start);
+      expect(state.topLevelDescs[visibleRange.start].virtual).toBeFalsy();
+      // The remaining overscan work continues without another scroll event.
+      expect(frames).toHaveLength(1);
+
+      let frameCount = 0;
+      while (frames.length && frameCount++ < 20) {
+        const start = performance.now();
+        frames.shift()(start);
+        expect(performance.now() - start).toBeLessThan(20);
+      }
+      expect(frameCount).toBeLessThan(20);
+      expect(frames).toHaveLength(0);
+      expect(realInRange()).toBe(overscanRange.end - overscanRange.start);
+    }
+    finally {
+      view.destroy();
+      place.remove();
+      scroller.remove();
+      HTMLElement.prototype.getBoundingClientRect = originalRect;
+      globalThis.requestAnimationFrame = originalRaf;
+      globalThis.cancelAnimationFrame = originalCancelRaf;
+      ydoc.destroy();
+    }
+  });
+
+  it('calibrates short table cells from their measured line count', async () => {
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const originalStyle = window.getComputedStyle;
+    const scroller = document.createElement('div');
+    scroller.style.overflowY = 'auto';
+    scroller.style.height = '100px';
+    document.body.appendChild(scroller);
+    const place = document.createElement('div');
+    scroller.appendChild(place);
+    const tableRows = 4;
+    const tableColumns = 2;
+    const cellHeight = 73.12;
+    const tableHeight = cellHeight * tableRows;
+    const trueHeight = tableHeight * 100;
+    const makeShortTable = () => {
+      const rows = [];
+      for (let row = 0; row < tableRows; row++) {
+        const cells = [];
+        for (let column = 0; column < tableColumns; column++) {
+          cells.push(schema.nodes.tableCell.create(null,
+            schema.text(`r${row}c${column}`)));
+        }
+        rows.push(schema.nodes.tableRow.create(null, cells));
+      }
+      return schema.nodes.table.create(null, rows);
+    };
+    const doc = schema.nodes.doc.create(null,
+      Array.from({ length: 100 }, () => makeShortTable()));
+    const ydoc = new Y.Doc();
+    const yfrag = ydoc.getXmlFragment('content');
+    updateYFragment(ydoc, yfrag, doc, { mapping: new Map(), isOMark: new Map() });
+    const { doc: boundDoc, mapping } = initProseMirrorDoc(yfrag, schema);
+    const view = new EditorView(place, {
+      state: EditorState.create({
+        doc: boundDoc,
+        plugins: [ySyncPlugin(yfrag, { mapping })],
+      }),
+      virtualizeTopLevel: { threshold: 10, overscanPx: 200 },
+    });
+
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 100 });
+    Object.defineProperty(scroller, 'scrollHeight', {
+      configurable: true,
+      get() {
+        let height = 0;
+        for (const child of view.dom.children) {
+          height += child.tagName == 'TABLE'
+            ? tableHeight
+            : Number.parseFloat(child.style.height) || 0;
+        }
+        return height;
+      },
+    });
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      if (this === scroller) {
+        return { top: 0, bottom: 100, left: 0, right: 800, width: 800, height: 100 };
+      }
+      if (this === view.dom) {
+        return { top: 0, bottom: 100, left: 0, right: 800, width: 800, height: 100 };
+      }
+      if (this.tagName == 'TD') {
+        return { top: 0, bottom: cellHeight, left: 0, right: 20, width: 20, height: cellHeight };
+      }
+      if (this.tagName == 'TR') {
+        return { top: 0, bottom: cellHeight, left: 0, right: 40, width: 40, height: cellHeight };
+      }
+      if (this.tagName == 'TABLE') {
+        return { top: 0, bottom: tableHeight, left: 0, right: 40, width: 40, height: tableHeight };
+      }
+      return originalRect.call(this);
+    };
+    window.getComputedStyle = element => {
+      const style = originalStyle.call(window, element);
+      if (element.tagName != 'TD') return style;
+      const overrides = {
+        lineHeight: '25.56px',
+        paddingTop: '10px',
+        paddingBottom: '10px',
+        borderTopWidth: '1px',
+        borderBottomWidth: '1px',
+      };
+      return new Proxy(style, {
+        get(target, property) {
+          if (property in overrides) return overrides[property];
+          const value = target[property];
+          return typeof value == 'function' ? value.bind(target) : value;
+        },
+      });
+    };
+
+    try {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      const calibration = view._virtualization.calibration.get('table');
+      expect(calibration).toBeTruthy();
+      // Four characters wrap onto two measured lines, so the column holds two
+      // characters per line even though the text is shorter than the old gate.
+      expect(calibration.columnChars).toEqual([2, 2]);
+      expect(Math.abs(scroller.scrollHeight - trueHeight) / trueHeight).toBeLessThan(0.03);
+    }
+    finally {
+      view.destroy();
+      place.remove();
+      scroller.remove();
+      HTMLElement.prototype.getBoundingClientRect = originalRect;
+      window.getComputedStyle = originalStyle;
+      ydoc.destroy();
+    }
+  });
 
   it('falls back to the model range when the blocks are not all in the document', () => {
     // A direct degenerate input: the descs are a mix of attached and
