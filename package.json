@@ -1,0 +1,16 @@
+{
+  "name": "beaver-pm-view",
+  "version": "1.42.3-pm.0",
+  "description": "Virtualization fork of prosemirror-view for Beaver-Notes — top-level block virtualization with measured-height placeholders, materialize-on-scroll/caret, and O(screen) reconciliation. Upstream base: prosemirror-view 1.42.3.",
+  "type": "module",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Daniele-rolli/beaver-pm-view.git"
+  }
+}
