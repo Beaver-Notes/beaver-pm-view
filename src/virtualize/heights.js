@@ -38,11 +38,56 @@ function computedStyleFor(dom) {
 }
 
 function estimatedTextLength(node) {
-    return node.isText ? node.text.length : node.textContent.length;
+    let text = node.isText ? node.text : node.textContent;
+    return text.trim().length;
 }
 
 function estimatedLineCount(length, charsPerLine) {
     return Math.max(1, Math.ceil(length / Math.max(1, charsPerLine)));
+}
+
+function measuredLineCount(height, lineHeight, marginTop, marginBottom, padding) {
+    let contentHeight = Math.max(0, height - padding);
+    let lines = Math.max(1, Math.round(contentHeight / lineHeight));
+    let error = Math.abs(contentHeight - lines * lineHeight);
+    for (let margin of [Math.max(marginTop, marginBottom), marginTop + marginBottom]) {
+        let value = Math.max(0, contentHeight - margin);
+        let candidate = Math.max(1, Math.round(value / lineHeight));
+        let candidateError = Math.abs(value - candidate * lineHeight);
+        if (candidateError < error) {
+            lines = candidate;
+            error = candidateError;
+        }
+    }
+    return lines;
+}
+
+function measuredTextLayout(dom, node, height) {
+    let style = computedStyleFor(dom);
+    let fontSize = style && pixelValue(style.fontSize) || DEFAULT_FONT_SIZE;
+    let lineHeight = style && pixelValue(style.lineHeight) || fontSize * 1.5;
+    let marginTop = style ? pixelValue(style.marginTop) : 0;
+    let marginBottom = style ? pixelValue(style.marginBottom) : 0;
+    // The first block of the editor has no top margin. That is a rule for the
+    // first block, so the type keeps its own top margin for every placeholder
+    // that stands in for it.
+    if (!marginTop && dom.parentNode && dom.parentNode.firstElementChild == dom)
+        marginTop = defaultVirtualMargin(node);
+    let margin = Math.max(marginTop, marginBottom);
+    let padding = style ? pixelValue(style.paddingTop) + pixelValue(style.paddingBottom) : 0;
+    let textLength = (dom.textContent || '').trim().length;
+    let lines = measuredLineCount(height, lineHeight, marginTop, marginBottom, padding);
+    return {
+        fontSize,
+        lineHeight,
+        marginTop,
+        marginBottom,
+        margin,
+        padding,
+        textLength,
+        lines,
+        charsPerLine: textLength >= MIN_CALIBRATION_TEXT_LENGTH ? textLength / lines : 0,
+    };
 }
 
 function calibratedHeight(state, key) {
@@ -129,6 +174,59 @@ export function estimateNodeHeight(view, node) {
     return DEFAULT_VIRTUAL_HEIGHT;
 }
 
+function emptyAccuracyAggregate() {
+    return {
+        count: 0,
+        estimated: 0,
+        measured: 0,
+        measuredCount: 0,
+        comparedEstimated: 0,
+        error: 0,
+        errorRatio: 0,
+        maxAbsError: 0,
+        worst: [],
+    };
+}
+
+function updateAccuracyAggregate(aggregate, type, estimated, measured, nodeSize) {
+    aggregate.count++;
+    aggregate.estimated += estimated;
+    if (measured == null)
+        return;
+    let error = estimated - measured;
+    aggregate.measuredCount++;
+    aggregate.measured += measured;
+    aggregate.comparedEstimated += estimated;
+    aggregate.error += error;
+    aggregate.maxAbsError = Math.max(aggregate.maxAbsError, Math.abs(error));
+    aggregate.worst.push({ type, estimated, measured, nodeSize, error });
+    aggregate.worst.sort((left, right) => Math.abs(right.error) - Math.abs(left.error));
+    if (aggregate.worst.length > 5)
+        aggregate.worst.length = 5;
+}
+
+function finishAccuracyAggregate(aggregate) {
+    aggregate.errorRatio = aggregate.measured ? aggregate.error / aggregate.measured : 0;
+    return aggregate;
+}
+
+export function estimateAccuracyReport(doc, calibration, measuredHeights, width = DEFAULT_CONTENT_WIDTH) {
+    let view = { _virtualization: { calibration, width } };
+    let total = emptyAccuracyAggregate(), types = {};
+    for (let index = 0; index < doc.childCount; index++) {
+        let node = doc.child(index), type = node.type.name;
+        let estimated = estimateNodeHeight(view, node);
+        let measured = measuredHeights && measuredHeights.get(node);
+        let aggregate = types[type] || (types[type] = emptyAccuracyAggregate());
+        updateAccuracyAggregate(aggregate, type, estimated, measured, node.nodeSize);
+        updateAccuracyAggregate(total, type, estimated, measured, node.nodeSize);
+    }
+    for (let type of Object.keys(types))
+        finishAccuracyAggregate(types[type]);
+    finishAccuracyAggregate(total);
+    return { total, types };
+}
+
 function refreshVirtualEstimates(view, state, key) {
     let children = state.topLevelDescs;
     if (!children)
@@ -152,8 +250,23 @@ export function calibrateNodeHeight(view, desc) {
     let key = virtualCalibrationKey(node);
     let calibration = state.calibration.get(key);
     if (calibration) {
-        if (node.type.name != 'table')
+        if (node.type.name != 'table') {
+            if (node.type.name != 'paragraph' && node.type.name != 'heading')
+                return;
+            let height = state.heights.get(node);
+            if (!(height > 0))
+                return;
+            let lineHeight = calibration.lineHeight || DEFAULT_LINE_HEIGHT;
+            let textLength = (node.textContent || '').trim().length;
+            let lines = measuredLineCount(height, lineHeight,
+                calibration.marginTop || 0, calibration.marginBottom || 0, calibration.padding || 0);
+            let charsPerLine = textLength >= MIN_CALIBRATION_TEXT_LENGTH ? textLength / lines : 0;
+            if (charsPerLine > (calibration.charsPerLine || 0)) {
+                calibration.charsPerLine = charsPerLine;
+                refreshVirtualEstimates(view, state, key);
+            }
             return;
+        }
         let rows = Array.from(dom.querySelectorAll('tr'));
         if (!rows.length)
             return;
@@ -175,19 +288,10 @@ export function calibrateNodeHeight(view, desc) {
     let height = dom.getBoundingClientRect().height;
     if (!(height > 0))
         return;
-    let style = computedStyleFor(dom);
-    let fontSize = style && pixelValue(style.fontSize) || DEFAULT_FONT_SIZE;
-    let lineHeight = style && pixelValue(style.lineHeight) || fontSize * 1.5;
-    let marginTop = style ? pixelValue(style.marginTop) : 0;
-    let marginBottom = style ? pixelValue(style.marginBottom) : 0;
-    // The first block of the editor has no top margin. That is a rule for the
-    // first block, so the type keeps its own top margin for every placeholder
-    // that stands in for it.
-    if (!marginTop && dom.parentNode && dom.parentNode.firstElementChild == dom)
-        marginTop = defaultVirtualMargin(node);
-    let margin = Math.max(marginTop, marginBottom);
-    let padding = style ? pixelValue(style.paddingTop) + pixelValue(style.paddingBottom) : 0;
-    let textLength = (dom.textContent || '').trim().length;
+    let layout = measuredTextLayout(dom, node, height);
+    let fontSize = layout.fontSize, lineHeight = layout.lineHeight;
+    let marginTop = layout.marginTop, marginBottom = layout.marginBottom;
+    let margin = layout.margin, padding = layout.padding;
     if (node.type.name == 'table') {
         let rows = Array.from(dom.querySelectorAll('tr'));
         if (!rows.length)
@@ -238,7 +342,6 @@ export function calibrateNodeHeight(view, desc) {
         });
     }
     else {
-        let lines = Math.max(1, Math.round(height / lineHeight));
         state.calibration.set(key, {
             fontSize,
             lineHeight,
@@ -247,7 +350,7 @@ export function calibrateNodeHeight(view, desc) {
             margin,
             margins: { top: marginTop, bottom: marginBottom },
             padding,
-            charsPerLine: textLength >= MIN_CALIBRATION_TEXT_LENGTH ? textLength / lines : 0,
+            charsPerLine: layout.charsPerLine,
         });
     }
     let width = view.dom.clientWidth;

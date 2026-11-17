@@ -14,7 +14,8 @@ import * as Y from 'yjs';
 import { describe, expect, it, vi } from 'vitest';
 import { Decoration, DecorationSet, EditorView, __findVirtualRange } from '../src/index.js';
 import { DEFAULT_TABLE_ROW_HEIGHT } from '../src/virtualize/constants.js';
-import { calibrateNodeHeight, estimateNodeHeight } from '../src/virtualize/heights.js';
+import { calibrateNodeHeight, estimateAccuracyReport, estimateNodeHeight } from '../src/virtualize/heights.js';
+import { materializeVirtualDescs } from '../src/virtualize/materialize.js';
 
 const schema = new Schema({
   nodes: {
@@ -126,6 +127,133 @@ function mockTableCellStyles() {
     });
   };
   return () => { window.getComputedStyle = originalStyle; };
+}
+
+function makeAccuracyState() {
+  return {
+    calibration: new Map(),
+    heights: new WeakMap(),
+    estimates: new WeakMap(),
+    heightAdjustments: new WeakMap(),
+    tableRowSamples: [],
+    topLevelDescs: null,
+    width: 800,
+  };
+}
+
+function calibrateMeasuredText(state, node, text, height, style) {
+  const dom = document.createElement(node.type.name == 'heading' ? `h${node.attrs.level}` : 'p');
+  dom.textContent = text;
+  dom.style.fontSize = style.fontSize;
+  dom.style.lineHeight = style.lineHeight;
+  dom.style.marginTop = style.marginTop;
+  dom.style.marginBottom = style.marginBottom;
+  dom.getBoundingClientRect = () => ({ height });
+  state.heights.set(node, height);
+  const view = { _virtualization: state, dom: { clientWidth: state.width } };
+  const originalStyle = window.getComputedStyle;
+  window.getComputedStyle = element => {
+    const computed = originalStyle.call(window, element);
+    if (element !== dom) return computed;
+    const overrides = {
+      fontSize: dom.style.fontSize,
+      lineHeight: dom.style.lineHeight,
+      marginTop: dom.style.marginTop,
+      marginBottom: dom.style.marginBottom,
+    };
+    return new Proxy(computed, {
+      get(target, property) {
+        if (property in overrides) return overrides[property];
+        const value = target[property];
+        return typeof value == 'function' ? value.bind(target) : value;
+      },
+    });
+  };
+  try {
+    calibrateNodeHeight(view, { node, dom, virtual: false });
+  }
+  finally {
+    window.getComputedStyle = originalStyle;
+  }
+}
+
+function calibrateMeasuredTables(state) {
+  const restoreStyles = mockTableCellStyles();
+  try {
+    for (let sample = 0; sample < 3; sample++) {
+      const table = makeTable(6, 3, 39);
+      const fixture = makeMeasuredTableFixture(table, 97.74, state);
+      calibrateNodeHeight(fixture.view, { node: table, dom: fixture.dom, virtual: false });
+    }
+  }
+  finally {
+    restoreStyles();
+  }
+}
+
+function makeAccuracyFixture() {
+  const state = makeAccuracyState();
+  const paragraphShort = schema.nodes.paragraph.create(null, schema.text('x'.repeat(40)));
+  const paragraphLong = schema.nodes.paragraph.create(null, schema.text('x'.repeat(110)));
+  const headingShort = schema.nodes.heading.create({ level: 2 }, schema.text('x'.repeat(40)));
+  const headingLong = schema.nodes.heading.create({ level: 2 }, schema.text('x'.repeat(120)));
+  const paragraphStyle = {
+    fontSize: '17.04px',
+    lineHeight: '25.56px',
+    marginTop: '8.52px',
+    marginBottom: '8.52px',
+  };
+  const headingStyle = {
+    fontSize: '25.56px',
+    lineHeight: '34.08px',
+    marginTop: '25.56px',
+    marginBottom: '25.56px',
+  };
+
+  calibrateMeasuredText(state, paragraphShort, 'x'.repeat(40), 25.56, paragraphStyle);
+  calibrateMeasuredText(state, paragraphLong, 'x'.repeat(110), 51.12, paragraphStyle);
+  calibrateMeasuredText(state, headingShort, 'x'.repeat(40), 34.08, headingStyle);
+  calibrateMeasuredText(state, headingLong, 'x'.repeat(120), 68.16, headingStyle);
+  calibrateMeasuredTables(state);
+
+  const measuredHeights = new WeakMap();
+  const nodes = [];
+  const paragraphs = [paragraphShort];
+  for (let index = 1; index < 2432; index++) {
+    paragraphs.push(schema.nodes.paragraph.create(null, schema.text('x'.repeat(110))));
+  }
+  const headings = [headingShort];
+  for (let index = 1; index < 68; index++) {
+    headings.push(schema.nodes.heading.create({ level: 2 }, schema.text('x'.repeat(120))));
+  }
+  const tableRowCounts = [
+    ...Array(250).fill(6),
+    ...Array(226).fill(7),
+    ...Array(24).fill(8),
+  ];
+  const tables = tableRowCounts.map(rows => makeTable(rows, 3, 39));
+
+  for (const node of paragraphs) {
+    nodes.push(node);
+    measuredHeights.set(node, node == paragraphShort ? 25.56 : 51.12);
+  }
+  for (const node of headings) {
+    nodes.push(node);
+    measuredHeights.set(node, node == headingShort ? 34.08 : 68.16);
+  }
+  for (const node of tables) {
+    nodes.push(node);
+    measuredHeights.set(node, node.childCount * 97.74);
+  }
+  // One unusually tall table row keeps the measured fixture total at the live
+  // 449,046 px without changing the median row-height calibration.
+  measuredHeights.set(tables[0], measuredHeights.get(tables[0]) + 146.16);
+
+  return {
+    doc: schema.nodes.doc.create(null, nodes),
+    calibration: state.calibration,
+    measuredHeights,
+  };
 }
 
 function makeList(items = 2, textLength = 110) {
@@ -1985,4 +2113,156 @@ describe('top-level virtualization', () => {
       HTMLElement.prototype.getBoundingClientRect = originalRect;
     }
   }, 60000);
+
+  it('reports per-type estimate errors for calibrated paragraphs and headings', () => {
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const originalStyle = window.getComputedStyle;
+    const nodes = Array.from({ length: 100 }, (_, index) =>
+      schema.nodes.paragraph.create(null, schema.text(`filler ${index}`)));
+    nodes.push(
+      schema.nodes.paragraph.create(null, schema.text('x'.repeat(40))),
+      schema.nodes.paragraph.create(null, schema.text('x'.repeat(110))),
+      schema.nodes.paragraph.create(null, schema.text('x'.repeat(110) + '  ')),
+      schema.nodes.heading.create({ level: 2 }, schema.text('x'.repeat(40))),
+      schema.nodes.heading.create({ level: 2 }, schema.text('x'.repeat(120))),
+      makeTable(6, 3, 39),
+    );
+    const sourceDoc = schema.nodes.doc.create(null, nodes);
+    const ydoc = new Y.Doc();
+    const yfrag = ydoc.getXmlFragment('content');
+    updateYFragment(ydoc, yfrag, sourceDoc, { mapping: new Map(), isOMark: new Map() });
+    const { doc } = initProseMirrorDoc(yfrag, schema);
+    const place = document.createElement('div');
+    document.body.appendChild(place);
+    const view = new EditorView(place, {
+      state: EditorState.create({ doc }),
+      virtualizeTopLevel: { threshold: 0, overscanPx: 0 },
+    });
+
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      let height = 0;
+      if (this.tagName == 'P')
+        height = this.textContent.trim().length >= 100 ? 51.12 : 25.56;
+      else if (this.tagName == 'H2')
+        height = this.textContent.trim().length >= 100 ? 68.16 : 34.08;
+      else if (this.tagName == 'TABLE')
+        height = this.querySelectorAll('tr').length * 97.74;
+      else if (this.tagName == 'TD')
+        height = 97.74;
+      else
+        return originalRect.call(this);
+      return { top: 0, bottom: height, left: 0, right: 800, width: 800, height };
+    };
+    window.getComputedStyle = element => {
+      const style = originalStyle.call(window, element);
+      const overrides = element.tagName == 'P' ? {
+        fontSize: '17.04px',
+        lineHeight: '25.56px',
+        marginTop: '8.52px',
+        marginBottom: '8.52px',
+      } : element.tagName == 'H2' ? {
+        fontSize: '25.56px',
+        lineHeight: '34.08px',
+        marginTop: '25.56px',
+        marginBottom: '25.56px',
+      } : element.tagName == 'TD' ? {
+        lineHeight: '25.56px',
+      } : {};
+      return new Proxy(style, {
+        get(target, property) {
+          if (property in overrides) return overrides[property];
+          const value = target[property];
+          return typeof value == 'function' ? value.bind(target) : value;
+        },
+      });
+    };
+
+    try {
+      withViewportHeight(1, () => {
+        const state = view._virtualization;
+        for (const index of [100, 101, 102, 103, 104, 105]) {
+          const desc = state.topLevelDescs[index];
+          expect(desc.virtual).toBe(true);
+          expect(materializeVirtualDescs(view, [desc])).toHaveLength(1);
+        }
+
+        const report = estimateAccuracyReport(view.state.doc, state.calibration, state.heights, state.width);
+        const paragraph = report.types.paragraph;
+        const heading = report.types.heading;
+
+        expect(state.calibration.get('paragraph').charsPerLine).toBeCloseTo(55);
+        expect(state.calibration.get('heading:2').charsPerLine).toBeCloseTo(60);
+        expect(paragraph.measuredCount).toBe(3);
+        expect(paragraph.measured).toBeCloseTo(127.8);
+        expect(Math.abs(paragraph.error) / paragraph.measured).toBeLessThan(0.03);
+        expect(paragraph.maxAbsError).toBeLessThan(0.03 * paragraph.measured / 2);
+        expect(paragraph.worst[0]).toEqual(expect.objectContaining({
+          type: 'paragraph',
+          estimated: expect.any(Number),
+          measured: expect.any(Number),
+          nodeSize: expect.any(Number),
+        }));
+
+        expect(heading.measuredCount).toBe(2);
+        expect(heading.measured).toBeCloseTo(102.24);
+        expect(Math.abs(heading.error) / heading.measured).toBeLessThan(0.03);
+        expect(heading.maxAbsError).toBeLessThan(0.03 * heading.measured / 2);
+      });
+    }
+    finally {
+      view.destroy();
+      place.remove();
+      ydoc.destroy();
+      HTMLElement.prototype.getBoundingClientRect = originalRect;
+      window.getComputedStyle = originalStyle;
+    }
+  });
+
+  it('keeps collapsed margins out of paragraph and heading line calibration', () => {
+    const state = makeAccuracyState();
+    const paragraph = schema.nodes.paragraph.create(null, schema.text('x'.repeat(110)));
+    const heading = schema.nodes.heading.create({ level: 2 }, schema.text('x'.repeat(120)));
+    const paragraphStyle = {
+      fontSize: '17.04px',
+      lineHeight: '25.56px',
+      marginTop: '8.52px',
+      marginBottom: '8.52px',
+    };
+    const headingStyle = {
+      fontSize: '25.56px',
+      lineHeight: '34.08px',
+      marginTop: '25.56px',
+      marginBottom: '25.56px',
+    };
+
+    // The paragraph includes both margins and the heading includes one
+    // collapsed margin in the measured height.
+    calibrateMeasuredText(state, paragraph, 'x'.repeat(110), 68.16, paragraphStyle);
+    calibrateMeasuredText(state, heading, 'x'.repeat(120), 93.72, headingStyle);
+
+    expect(state.calibration.get('paragraph').charsPerLine).toBeCloseTo(55);
+    expect(state.calibration.get('heading:2').charsPerLine).toBeCloseTo(60);
+    const view = { _virtualization: state };
+    expect(estimateNodeHeight(view, paragraph)).toBeCloseTo(51.12);
+    expect(estimateNodeHeight(view, heading)).toBeCloseTo(68.16);
+  });
+
+  it('keeps a mixed 3,000-block document estimate within three percent', () => {
+    const { doc, calibration, measuredHeights } = makeAccuracyFixture();
+    const report = estimateAccuracyReport(doc, calibration, measuredHeights, 800);
+
+    expect(report.total.count).toBe(3000);
+    expect(report.total.measuredCount).toBe(3000);
+    expect(report.total.measured).toBeCloseTo(449046, 2);
+    expect(report.total.estimated).toBeCloseTo(448899.84, 2);
+    expect(report.total.error).toBeCloseTo(-146.16, 2);
+    expect(report.types.paragraph.estimated).toBeCloseTo(124298.28, 2);
+    expect(report.types.paragraph.error).toBeCloseTo(0, 2);
+    expect(report.types.heading.estimated).toBeCloseTo(4600.8, 2);
+    expect(report.types.heading.error).toBeCloseTo(0, 2);
+    expect(report.types.table.estimated).toBeCloseTo(320000.76, 2);
+    expect(Math.abs(report.total.error) / report.total.measured).toBeLessThan(0.03);
+    expect(Math.abs(report.types.paragraph.error) / report.types.paragraph.measured).toBeLessThan(0.03);
+    expect(Math.abs(report.types.heading.error) / report.types.heading.measured).toBeLessThan(0.03);
+  });
 });
