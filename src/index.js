@@ -1,6 +1,8 @@
 import { TextSelection, NodeSelection, AllSelection, Selection } from 'prosemirror-state';
 import { DOMSerializer, Fragment, Mark, Slice, DOMParser } from 'prosemirror-model';
 import { dropPoint } from 'prosemirror-transform';
+// fork hook (virtualization): see src/virtualize/index.js
+import * as virtualization from './virtualize/index.js';
 
 const domIndex = function (node) {
     for (var index = 0;; index++) {
@@ -1273,1289 +1275,6 @@ class MarkViewDesc extends ViewDesc {
         super.destroy();
     }
 }
-const DEFAULT_VIRTUAL_HEIGHT = 300;
-const VIRTUAL_PLACEHOLDER_CLASS = 'ProseMirror-virtual-placeholder';
-const DEFAULT_CONTENT_WIDTH = 800;
-const DEFAULT_FONT_SIZE = 17.04;
-const DEFAULT_LINE_HEIGHT = 25.56;
-const DEFAULT_PARAGRAPH_MARGIN = 8.52;
-const DEFAULT_AVG_CHAR_WIDTH = 8.5;
-const DEFAULT_TABLE_AVG_CHAR_WIDTH = 7;
-const DEFAULT_TABLE_CELL_PADDING = 22;
-const DEFAULT_TABLE_LINE_HEIGHT = 25.56;
-const DEFAULT_LIST_MARGIN = 21.3;
-const DEFAULT_LIST_ITEM_MARGIN = 8.52;
-const DEFAULT_CODE_LINE_HEIGHT = 25.56;
-const DEFAULT_CODE_PADDING = 36;
-const DEFAULT_CODE_MARGIN = 25.56;
-const MIN_CALIBRATION_TEXT_LENGTH = 40;
-// Above this many replaced top-level blocks the change is a bulk rewrite, not
-// a local edit, and the virtualized reconciler is cheaper than the generic
-// ProseMirror path.
-const MAX_FAST_PATH_BLOCKS = 8;
-const DEFAULT_HEADING = {
-    1: { fontSize: 38.34, lineHeight: 42.6, margin: 38.34 },
-    2: { fontSize: 25.56, lineHeight: 34.08, margin: 25.56 },
-    3: { fontSize: 21.3, lineHeight: 34.08, margin: 21.3 },
-    4: { fontSize: 17.04, lineHeight: 25.56, margin: 17.04 },
-    5: { fontSize: 17.04, lineHeight: 25.56, margin: 17.04 },
-    6: { fontSize: 17.04, lineHeight: 25.56, margin: 17.04 },
-};
-
-function virtualOptions(view) {
-    let options = view._props.virtualizeTopLevel;
-    if (!options || options.enabled === false ||
-        !Number.isFinite(options.threshold) || options.threshold < 0 ||
-        !Number.isFinite(options.overscanPx) || options.overscanPx < 0)
-        return null;
-    return options;
-}
-
-function virtualScroller(view) {
-    for (let element = view.dom; element && element.nodeType == 1; element = element.parentElement) {
-        if (/(auto|scroll|overlay)/.test(getComputedStyle(element).overflowY))
-            return { element };
-    }
-    return { window: view.root.defaultView || window };
-}
-
-function virtualViewport(view) {
-    let scroller = virtualScroller(view);
-    if (scroller.element) {
-        let rect = scroller.element.getBoundingClientRect();
-        let window = view.root.defaultView || globalThis.window;
-        // The scroll container's box is not the viewport. A container that is
-        // not height constrained reports the height of its content, which
-        // would put the whole document into the visible band and materialize
-        // every block. Only the part of the container the window shows is
-        // visible.
-        let top = Math.max(rect.top, 0);
-        let bottom = Math.min(rect.bottom, window.innerHeight || rect.bottom);
-        if (bottom <= top) {
-            top = rect.top;
-            bottom = rect.bottom;
-        }
-        return { top, bottom, scroller };
-    }
-    return { top: 0, bottom: scroller.window.innerHeight, scroller };
-}
-
-function destroyVirtualization(view) {
-    let state = view._virtualization;
-    if (!state)
-        return;
-    if (state.scrollRaf != null)
-        cancelAnimationFrame(state.scrollRaf);
-    if (state.activationRaf != null)
-        cancelAnimationFrame(state.activationRaf);
-    if (state.scrollTarget && state.scrollHandler)
-        state.scrollTarget.removeEventListener('scroll', state.scrollHandler);
-    view._virtualization = null;
-}
-
-function attachVirtualScroll(view, state) {
-    let scroller = virtualScroller(view);
-    state.scrollTarget = scroller.window || scroller.element;
-    state.scrollHandler = () => {
-        if (state.scrollRaf != null)
-            return;
-        state.scrollRaf = requestAnimationFrame(() => {
-            state.scrollRaf = null;
-            if (!view.isDestroyed)
-                activateVirtualization(view);
-        });
-    };
-    state.scrollTarget.addEventListener('scroll', state.scrollHandler, { passive: true });
-}
-
-function virtualCalibrationKey(node) {
-    if (node.type.name == 'heading')
-        return 'heading:' + node.attrs.level;
-    return node.type.name;
-}
-
-function pixelValue(value) {
-    let number = Number.parseFloat(value);
-    return Number.isFinite(number) && number > 0 ? number : 0;
-}
-
-function computedStyleFor(dom) {
-    let window = dom.ownerDocument && dom.ownerDocument.defaultView;
-    return window ? window.getComputedStyle(dom) : null;
-}
-
-function estimatedTextLength(node) {
-    return node.isText ? node.text.length : node.textContent.length;
-}
-
-function estimatedLineCount(length, charsPerLine) {
-    return Math.max(1, Math.ceil(length / Math.max(1, charsPerLine)));
-}
-
-function calibratedHeight(state, key) {
-    return state.calibration.get(key);
-}
-
-function estimateNodeHeight(view, node) {
-    let state = view._virtualization;
-    if (!state)
-        return DEFAULT_VIRTUAL_HEIGHT;
-    let name = node.type.name, width = state.width || DEFAULT_CONTENT_WIDTH;
-    if (name == 'paragraph') {
-        let calibration = calibratedHeight(state, name);
-        let lineHeight = calibration && calibration.lineHeight || DEFAULT_LINE_HEIGHT;
-        let charsPerLine = calibration && calibration.charsPerLine || width / DEFAULT_AVG_CHAR_WIDTH;
-        return estimatedLineCount(estimatedTextLength(node), charsPerLine) * lineHeight;
-    }
-    if (name == 'heading') {
-        let level = Math.min(6, Math.max(1, node.attrs.level || 1));
-        let key = 'heading:' + level, defaults = DEFAULT_HEADING[level];
-        let calibration = calibratedHeight(state, key);
-        let lineHeight = calibration && calibration.lineHeight || defaults.lineHeight;
-        let fontSize = calibration && calibration.fontSize || defaults.fontSize;
-        let charsPerLine = calibration && calibration.charsPerLine || width / (fontSize * .5);
-        return estimatedLineCount(estimatedTextLength(node), charsPerLine) * lineHeight;
-    }
-    if (name == 'table') {
-        let rows = node.childCount, columns = rows ? node.child(0).childCount : 0;
-        if (!rows || !columns)
-            return DEFAULT_VIRTUAL_HEIGHT;
-        let calibration = calibratedHeight(state, name);
-        let lineHeight = calibration && calibration.cellLineHeight || DEFAULT_TABLE_LINE_HEIGHT;
-        let padding = calibration && calibration.cellPadding != null ? calibration.cellPadding : DEFAULT_TABLE_CELL_PADDING;
-        let columnChars = calibration && calibration.columnChars;
-        let height = 0;
-        for (let rowIndex = 0; rowIndex < rows; rowIndex++) {
-            let row = node.child(rowIndex), lines = 1;
-            for (let column = 0; column < row.childCount; column++) {
-                let cell = row.child(column);
-                let charsPerLine = columnChars && columnChars[column] || width / columns / DEFAULT_TABLE_AVG_CHAR_WIDTH;
-                lines = Math.max(lines, estimatedLineCount(estimatedTextLength(cell), charsPerLine));
-            }
-            height += lines * lineHeight + padding;
-        }
-        return height;
-    }
-    if (name == 'bulletList' || name == 'orderedList') {
-        let calibration = calibratedHeight(state, name);
-        let lineHeight = calibration && calibration.lineHeight || DEFAULT_LINE_HEIGHT;
-        let charsPerLine = calibration && calibration.charsPerLine || width / DEFAULT_AVG_CHAR_WIDTH;
-        let items = node.childCount;
-        let lines = Math.max(items, estimatedLineCount(estimatedTextLength(node), charsPerLine));
-        return lines * lineHeight + items * DEFAULT_LIST_ITEM_MARGIN;
-    }
-    if (name == 'codeBlock') {
-        let calibration = calibratedHeight(state, name);
-        let lineHeight = calibration && calibration.lineHeight || DEFAULT_CODE_LINE_HEIGHT;
-        let padding = calibration && calibration.padding != null ? calibration.padding : DEFAULT_CODE_PADDING;
-        let lines = Math.max(1, node.textContent.split(/\r\n|\r|\n/).length);
-        return lines * lineHeight + padding;
-    }
-    if (name == 'div') {
-        let calibration = calibratedHeight(state, name);
-        let lineHeight = calibration && calibration.lineHeight || DEFAULT_LINE_HEIGHT;
-        let charsPerLine = calibration && calibration.charsPerLine || width / DEFAULT_AVG_CHAR_WIDTH;
-        let lines = Math.max(node.childCount, estimatedLineCount(estimatedTextLength(node), charsPerLine));
-        return lines * lineHeight;
-    }
-    return DEFAULT_VIRTUAL_HEIGHT;
-}
-
-function refreshVirtualEstimates(view, state, key) {
-    let children = state.topLevelDescs;
-    if (!children)
-        return;
-    for (let desc of children) {
-        if (!desc || !desc.virtual || !desc.node || virtualCalibrationKey(desc.node) != key)
-            continue;
-        if (!state.heights.get(desc.node))
-            state.estimates.set(desc.node, estimateNodeHeight(view, desc.node));
-        let height = virtualHeight(view, desc.node);
-        desc.estimatedHeight = height;
-        desc.dom.style.height = height + 'px';
-        applyVirtualMargins(desc.dom, virtualMargins(state, desc.node));
-    }
-}
-
-function calibrateNodeHeight(view, desc) {
-    let state = view._virtualization, node = desc && desc.node, dom = desc && desc.dom;
-    if (!state || !node || !dom || dom.nodeType != 1 || desc.virtual)
-        return;
-    let key = virtualCalibrationKey(node);
-    if (state.calibration.has(key))
-        return;
-    let height = dom.getBoundingClientRect().height;
-    if (!(height > 0))
-        return;
-    let style = computedStyleFor(dom);
-    let fontSize = style && pixelValue(style.fontSize) || DEFAULT_FONT_SIZE;
-    let lineHeight = style && pixelValue(style.lineHeight) || fontSize * 1.5;
-    let marginTop = style ? pixelValue(style.marginTop) : 0;
-    let marginBottom = style ? pixelValue(style.marginBottom) : 0;
-    // The first block of the editor has no top margin. That is a rule for the
-    // first block, so the type keeps its own top margin for every placeholder
-    // that stands in for it.
-    if (!marginTop && dom.parentNode && dom.parentNode.firstElementChild == dom)
-        marginTop = defaultVirtualMargin(node);
-    let margin = Math.max(marginTop, marginBottom);
-    let padding = style ? pixelValue(style.paddingTop) + pixelValue(style.paddingBottom) : 0;
-    let textLength = (dom.textContent || '').trim().length;
-    if (node.type.name == 'table') {
-        let rows = Array.from(dom.querySelectorAll('tr'));
-        if (!rows.length)
-            return;
-        let lineHeightTotal = 0, paddingTotal = 0, samples = 0;
-        let columnChars = [], columnSamples = [];
-        for (let row of rows) {
-            let cells = Array.from(row.children);
-            for (let column = 0; column < cells.length; column++) {
-                let cell = cells[column], cellStyle = computedStyleFor(cell);
-                let cellLineHeight = cellStyle && pixelValue(cellStyle.lineHeight) || DEFAULT_TABLE_LINE_HEIGHT;
-                let cellPadding = cellStyle
-                    ? pixelValue(cellStyle.paddingTop) + pixelValue(cellStyle.paddingBottom) +
-                        pixelValue(cellStyle.borderTopWidth) + pixelValue(cellStyle.borderBottomWidth)
-                    : DEFAULT_TABLE_CELL_PADDING;
-                let cellHeight = cell.getBoundingClientRect().height;
-                if (!(cellHeight > 0))
-                    continue;
-                let lines = Math.max(1, Math.ceil((cellHeight - cellPadding) / cellLineHeight - .05));
-                let cellTextLength = (cell.textContent || '').trim().length;
-                let chars = cellTextLength >= MIN_CALIBRATION_TEXT_LENGTH ? cellTextLength / lines : 0;
-                if (chars) {
-                    columnChars[column] = (columnChars[column] || 0) + chars;
-                    columnSamples[column] = (columnSamples[column] || 0) + 1;
-                }
-                lineHeightTotal += cellLineHeight;
-                paddingTotal += cellPadding;
-                samples++;
-            }
-        }
-        if (!samples)
-            return;
-        for (let column = 0; column < columnChars.length; column++)
-            columnChars[column] = columnSamples[column] ? columnChars[column] / columnSamples[column] : 0;
-        state.calibration.set(key, {
-            cellLineHeight: lineHeightTotal / samples,
-            cellPadding: paddingTotal / samples,
-            columnChars,
-            marginTop,
-            marginBottom,
-            margin,
-            margins: { top: marginTop, bottom: marginBottom },
-        });
-    }
-    else {
-        let lines = Math.max(1, Math.round(height / lineHeight));
-        state.calibration.set(key, {
-            fontSize,
-            lineHeight,
-            marginTop,
-            marginBottom,
-            margin,
-            margins: { top: marginTop, bottom: marginBottom },
-            padding,
-            charsPerLine: textLength >= MIN_CALIBRATION_TEXT_LENGTH ? textLength / lines : 0,
-        });
-    }
-    let width = view.dom.clientWidth;
-    if (width > 0)
-        state.width = width;
-    refreshVirtualEstimates(view, state, key);
-}
-
-// A measured block occupies its border box plus the margins the browser
-// collapses around it. A placeholder that replaces it has to carry the same
-// margins, otherwise the swap changes the flow height and the content below
-// it moves.
-function defaultVirtualMargin(node) {
-    let name = node.type.name;
-    if (name == 'paragraph' || name == 'div')
-        return DEFAULT_PARAGRAPH_MARGIN;
-    if (name == 'heading') {
-        let level = Math.min(6, Math.max(1, node.attrs.level || 1));
-        let defaults = DEFAULT_HEADING[level] || DEFAULT_HEADING[4];
-        return defaults.margin;
-    }
-    if (name == 'bulletList' || name == 'orderedList')
-        return DEFAULT_LIST_MARGIN;
-    if (name == 'codeBlock')
-        return DEFAULT_CODE_MARGIN;
-    return 0;
-}
-
-// The margin objects are shared per node type: the reconciler compares them
-// by identity to know whether a placeholder has to be restyled.
-const virtualDefaultMargins = new Map;
-
-function virtualMargins(state, node) {
-    if (!state || !node)
-        return null;
-    let key = virtualCalibrationKey(node);
-    let calibration = state.calibration.get(key);
-    if (calibration)
-        return calibration.margins;
-    let margins = virtualDefaultMargins.get(key);
-    if (!margins) {
-        let value = defaultVirtualMargin(node);
-        margins = { top: value, bottom: value };
-        virtualDefaultMargins.set(key, margins);
-    }
-    return margins;
-}
-
-function applyVirtualMargins(dom, margins) {
-    if (!dom || !margins)
-        return;
-    let top = margins.top + 'px', bottom = margins.bottom + 'px';
-    if (dom.style.marginTop != top) dom.style.marginTop = top;
-    if (dom.style.marginBottom != bottom) dom.style.marginBottom = bottom;
-}
-
-function virtualHeight(view, node) {
-    let state = view._virtualization;
-    if (!state)
-        return DEFAULT_VIRTUAL_HEIGHT;
-    let height = state.heights.get(node);
-    if (!(height > 0)) {
-        height = state.estimates.get(node);
-        if (!(height > 0)) {
-            height = estimateNodeHeight(view, node);
-            state.estimates.set(node, height);
-        }
-    }
-    height += state.heightAdjustments.get(node) || 0;
-    return height > 0 ? height : 0;
-}
-
-function virtualNodeEdgeText(node) {
-    let first = node.firstChild, last = node.lastChild;
-    while (first && !first.isText && !first.isLeaf) first = first.firstChild;
-    while (last && !last.isText && !last.isLeaf) last = last.lastChild;
-    return (first && first.isText ? first.text.slice(0, 32) : '') + '\0' +
-        (last && last.isText ? last.text.slice(-32) : '');
-}
-
-function virtualNodeKey(node) {
-    let attrs = Object.keys(node.attrs).sort().map(name => {
-        let value = node.attrs[name];
-        if (value && typeof value == 'object') {
-            try { value = JSON.stringify(value); }
-            catch { value = String(value); }
-        }
-        return name + '=' + String(value);
-    }).join(';');
-    return node.type.name + '\0' + attrs + '\0' + virtualNodeEdgeText(node);
-}
-
-function sameVirtualNodeShape(oldNode, node) {
-    return oldNode.sameMarkup(node) && oldNode.nodeSize == node.nodeSize &&
-        oldNode.childCount == node.childCount &&
-        virtualNodeEdgeText(oldNode) == virtualNodeEdgeText(node);
-}
-
-function copyVirtualNodeState(state, oldNode, node, sameShape) {
-    if (sameShape) {
-        let height = state.heights.get(oldNode);
-        if (height != null && !state.heights.has(node)) state.heights.set(node, height);
-        let estimate = state.estimates.get(oldNode);
-        if (estimate != null && !state.estimates.has(node)) state.estimates.set(node, estimate);
-    }
-    let adjustment = state.heightAdjustments.get(oldNode);
-    if (adjustment != null && !state.heightAdjustments.has(node))
-        state.heightAdjustments.set(node, adjustment);
-}
-
-function queueVirtualMatch(map, key, desc) {
-    let queue = map.get(key);
-    if (!queue) map.set(key, queue = { items: [], index: 0 });
-    queue.items.push(desc);
-}
-
-function takeVirtualMatch(map, key, used) {
-    let queue = map.get(key);
-    while (queue && queue.index < queue.items.length) {
-        let desc = queue.items[queue.index++];
-        if (!used.has(desc)) return desc;
-    }
-    return null;
-}
-
-function virtualRangeForDescs(view, descs, overscan) {
-    let viewport = virtualViewport(view);
-    let editorRect = view.dom.getBoundingClientRect();
-    let visibleTop = viewport.top - editorRect.top - overscan;
-    let visibleBottom = viewport.bottom - editorRect.top + overscan;
-    let offset = 0, start = descs.length, end = 0;
-    for (let index = 0; index < descs.length; index++) {
-        let desc = descs[index];
-        let box = desc.estimatedHeight;
-        if (!(box > 0)) box = virtualHeight(view, desc.node);
-        let height = virtualFlowHeightFor(view, desc.node, box);
-        if (offset < visibleBottom && offset + height > visibleTop) {
-            start = Math.min(start, index);
-            end = Math.max(end, index + 1);
-        }
-        offset += height;
-    }
-    return { start, end };
-}
-
-function topLevelStructureChanged(state, doc) {
-    let descs = state.topLevelDescs;
-    if (descs.length != doc.childCount)
-        return true;
-    let oldIndices = new Map;
-    for (let index = 0; index < descs.length; index++) {
-        let desc = descs[index];
-        if (!desc || !desc.node)
-            return true;
-        oldIndices.set(desc.node, index);
-    }
-    let matchedOld = new Uint8Array(descs.length), unmatchedNew = [], lastIndex = -1;
-    for (let index = 0; index < doc.childCount; index++) {
-        let oldIndex = oldIndices.get(doc.child(index));
-        if (oldIndex == null) {
-            unmatchedNew.push(index);
-            continue;
-        }
-        if (oldIndex <= lastIndex)
-            return true;
-        lastIndex = oldIndex;
-        matchedOld[oldIndex] = 1;
-    }
-    let unmatchedOld = [];
-    for (let index = 0; index < matchedOld.length; index++)
-        if (!matchedOld[index]) unmatchedOld.push(index);
-    if (unmatchedOld.length != unmatchedNew.length)
-        return true;
-    // A wholesale rewrite (e.g. a shared document projection that replaces
-    // every top-level child with a fresh node object) keeps the child count
-    // and the unmatched positions, so it looks like a content-only change.
-    // Rebuilding all of those blocks through the generic ProseMirror path is
-    // far more expensive than the virtualized reconciler.
-    if (unmatchedOld.length > MAX_FAST_PATH_BLOCKS)
-        return true;
-    for (let index = 0; index < unmatchedOld.length; index++)
-        if (unmatchedOld[index] != unmatchedNew[index])
-            return true;
-    return false;
-}
-
-// The window follows the blocks that were in it. A structural change moves
-// the blocks around, and the reconciliation knows where the reused blocks
-// went, so the window can be remapped without reading the layout. That
-// matters during a rebuild: the new blocks are detached, so their layout
-// cannot be measured, and the old window would point at the wrong blocks.
-function remappedVirtualRange(state, oldNodeDescs, matched) {
-    let previous = state.range;
-    if (!previous || !previous.end)
-        return null;
-    let newIndex = new Map;
-    for (let index = 0; index < matched.length; index++)
-        if (matched[index])
-            newIndex.set(matched[index], index);
-    let start = -1, end = -1;
-    for (let oldIndex = previous.start; oldIndex < previous.end && oldIndex < oldNodeDescs.length; oldIndex++) {
-        let index = newIndex.get(oldNodeDescs[oldIndex]);
-        if (index == null)
-            continue;
-        if (start < 0 || index < start) start = index;
-        if (index + 1 > end) end = index + 1;
-    }
-    return start < 0 ? null : { start, end };
-}
-
-function updateVirtualTopLevelChildren(parent, view) {
-    let state = view._virtualization, oldChildren = parent.children;
-    if (!topLevelStructureChanged(state, parent.node))
-        return false;
-    let nodes = [], outerDecos = [], innerDecos = [], nodePositions = [], entries = [], nodePos = 0;
-    iterDeco(parent.node, parent.innerDeco, widget => {
-        entries.push({ widget, pos: nodePos });
-    }, (child, outerDeco, innerDeco) => {
-        let index = nodes.length;
-        entries.push({ nodeIndex: index });
-        nodes.push(child);
-        outerDecos.push(outerDeco);
-        innerDecos.push(innerDeco);
-        nodePositions.push(nodePos);
-        nodePos += child.nodeSize;
-    });
-
-    let byNode = new Map, byContent = new Map, byKey = new Map;
-    let oldNodeDescs = [], oldWidgetDescs = [];
-    for (let desc of oldChildren) {
-        if (!desc) continue;
-        if (desc.node) {
-            oldNodeDescs.push(desc);
-            queueVirtualMatch(byNode, desc.node, desc);
-            queueVirtualMatch(byContent, desc.node.content, desc);
-            queueVirtualMatch(byKey, virtualNodeKey(desc.node), desc);
-        }
-        else if (desc instanceof WidgetViewDesc) {
-            oldWidgetDescs.push(desc);
-        }
-    }
-
-    let used = new Set, matched = [];
-    for (let index = 0; index < nodes.length; index++) {
-        let node = nodes[index];
-        let desc = takeVirtualMatch(byNode, node, used);
-        if (!desc) desc = takeVirtualMatch(byContent, node.content, used);
-        if (desc) {
-            used.add(desc);
-            matched[index] = desc;
-        }
-    }
-    for (let index = 0; index < nodes.length; index++) {
-        if (matched[index]) continue;
-        let desc = takeVirtualMatch(byKey, virtualNodeKey(nodes[index]), used);
-        if (desc) {
-            used.add(desc);
-            matched[index] = desc;
-        }
-    }
-    for (let index = 0; index < nodes.length; index++) {
-        if (matched[index]) continue;
-        let desc = oldNodeDescs[index];
-        if (desc && !used.has(desc) && desc.node && desc.node.sameMarkup(nodes[index])) {
-            used.add(desc);
-            matched[index] = desc;
-        }
-    }
-    for (let entry of entries) {
-        if (!entry.widget) continue;
-        for (let desc of oldWidgetDescs) {
-            if (used.has(desc) || !desc.matchesWidget(entry.widget)) continue;
-            if (entry.widget != desc.widget && desc.widget.type.toDOM.parentNode) continue;
-            entry.desc = desc;
-            used.add(desc);
-            break;
-        }
-    }
-
-    let initialPlaceholderDOMs = null;
-    if (!view.docView && state.range && !parent.contentDOM.firstChild) {
-        let heights = [], margins = [];
-        for (let index = 0; index < nodes.length; index++) {
-            heights.push(virtualHeight(view, nodes[index]));
-            margins.push(virtualMargins(state, nodes[index]));
-        }
-        initialPlaceholderDOMs = createVirtualDOMBatch(parent.contentDOM, heights, margins);
-    }
-
-    let nextNodeDescs = [], nextChildren = [];
-    for (let index = 0; index < nodes.length; index++) {
-        let desc = matched[index], node = nodes[index];
-        if (!desc) {
-            if (!view.docView && state.range && index >= state.range.start && index < state.range.end) {
-                desc = NodeViewDesc.create(parent, node, outerDecos[index], innerDecos[index], view, nodePositions[index], index);
-                let placeholder = initialPlaceholderDOMs && initialPlaceholderDOMs[index];
-                if (placeholder && placeholder.parentNode == parent.contentDOM)
-                    parent.contentDOM.replaceChild(desc.dom, placeholder);
-            }
-            else {
-                let height = virtualHeight(view, node);
-                let dom = initialPlaceholderDOMs ? initialPlaceholderDOMs[index] : createVirtualDOM(height);
-                // A placeholder carries the margins of the block it stands in
-                // for, so the swap does not change the flow height.
-                applyVirtualMargins(dom, virtualMargins(state, node));
-                desc = new VirtualNodeViewDesc(parent, node, outerDecos[index], innerDecos[index], dom, height, view);
-            }
-        }
-        desc.parent = parent;
-        desc.topLevelIndex = index;
-        nextNodeDescs[index] = desc;
-    }
-    for (let entry of entries) {
-        if (entry.widget) {
-            nextChildren.push(entry.desc || new WidgetViewDesc(parent, entry.widget, view, entry.pos));
-        }
-        else {
-            nextChildren.push(nextNodeDescs[entry.nodeIndex]);
-        }
-    }
-    parent.children = nextChildren;
-
-    for (let index = 0; index < nodes.length; index++) {
-        let desc = nextNodeDescs[index], oldNode = desc.node;
-        if (!oldNode) continue;
-        if (desc.virtual) {
-            desc.update(nodes[index], outerDecos[index], innerDecos[index], view);
-        }
-        else {
-            copyVirtualNodeState(state, oldNode, nodes[index], sameVirtualNodeShape(oldNode, nodes[index]));
-            if (!desc.update(nodes[index], outerDecos[index], innerDecos[index], view)) {
-                let childIndex = parent.children.indexOf(desc);
-                desc.destroy();
-                let height = virtualHeight(view, nodes[index]);
-                let dom = createVirtualDOM(height);
-                applyVirtualMargins(dom, virtualMargins(state, nodes[index]));
-                desc = new VirtualNodeViewDesc(parent, nodes[index], outerDecos[index], innerDecos[index],
-                    dom, height, view);
-                desc.topLevelIndex = index;
-                nextNodeDescs[index] = desc;
-                if (childIndex >= 0) {
-                    parent.children[childIndex] = desc;
-                    nextChildren[childIndex] = desc;
-                }
-            }
-        }
-    }
-    for (let desc of oldChildren)
-        if (!used.has(desc)) desc.destroy();
-
-    state.topLevelDescs.length = nodes.length;
-    for (let index = 0; index < nextNodeDescs.length; index++)
-        state.topLevelDescs[index] = nextNodeDescs[index];
-    // The visible range and the scroll anchor are read before the DOM
-    // changes. Reading the layout after the mutation forces a layout pass
-    // over the whole editor, which is what made structural edits expensive.
-    // Only descs that are in the document can be measured: a rebuild
-    // creates every desc detached, and a detached element has no rectangle,
-    // which would make the whole document look visible and materialize it.
-    // A rebuild therefore remaps the window and skips the anchor, because
-    // there is nothing rendered to anchor to.
-    let range = null, anchor = null;
-    if (!state.activationPending) {
-        // The range can only be measured when every block is in the
-        // document. A rebuild creates the new blocks detached, and a
-        // detached element has no rectangle: one detached block is enough
-        // to make the binary search degenerate, because its 0/0 rectangle
-        // looks like "inside the viewport" to the search.
-        let rendered = state.topLevelDescs.every(desc => desc && desc.dom && desc.dom.parentNode == parent.contentDOM);
-        if (rendered && hasUsableLayout(view)) {
-            range = findVirtualRange(view, state.options.overscanPx);
-            anchor = captureVirtualAnchor(view);
-        }
-        else {
-            // The rebuilt blocks are not in the document yet, so the layout
-            // cannot be measured. The window follows the blocks that were
-            // in it: a structural change moves them, and the reconciliation
-            // knows where they went. The model range is only the last
-            // resort, because it is too coarse to replace a measured one:
-            // it would move the materialized blocks and make the editor
-            // flash placeholders.
-            range = remappedVirtualRange(state, oldNodeDescs, matched);
-            if (!range)
-                range = virtualRangeForDescs(view, state.topLevelDescs, state.options.overscanPx);
-        }
-    }
-    renderDescs(parent.contentDOM, nextChildren, view);
-    if (initialPlaceholderDOMs && view.trackWrites == parent.contentDOM)
-        view.trackWrites = null;
-    if (!state.activationPending) {
-        for (let desc of nextNodeDescs)
-            if (!desc.virtual) calibrateNodeHeight(view, desc);
-
-        state.range = range;
-        state.docChildCount = nodes.length;
-        if (view.docView) {
-            dematerializeRealDescs(view, state, { keepSelection: true, anchor });
-
-            let entering = [];
-            for (let index = range.start; index < range.end; index++) {
-                let desc = state.topLevelDescs[index];
-                if (desc && desc.virtual) entering.push(desc);
-            }
-            materializeVirtualDescs(view, entering, { anchor });
-            state.topLevelChanged = false;
-        }
-    }
-    else {
-        state.docChildCount = nodes.length;
-    }
-    return true;
-}
-
-function topLevelIndexAtPos(doc, pos) {
-    if (!doc.childCount)
-        return -1;
-    let $pos = doc.resolve(Math.max(0, Math.min(pos, doc.content.size)));
-    let index = $pos.index(0);
-    return index < doc.childCount ? index : doc.childCount - 1;
-}
-
-function virtualRangeForBuild(view, doc) {
-    let state = view._virtualization;
-    let viewport = virtualViewport(view);
-    let editorRect = view.dom.getBoundingClientRect();
-    let overscan = state.options.overscanPx;
-    // While the view is constructed the editor element is still detached
-    // (Tiptap moves it into the document on the next tick), so it has no
-    // rectangle to measure against. The initial window is a model
-    // assumption then: the document starts at the top of the viewport.
-    let laidOut = editorRect.height > 0 || view.dom.offsetHeight > 0;
-    let visibleTop = laidOut ? viewport.top - editorRect.top - overscan : -overscan;
-    let visibleBottom = laidOut ? viewport.bottom - editorRect.top + overscan : viewport.bottom + overscan;
-    let offset = 0, start = doc.childCount, end = 0;
-    for (let i = 0; i < doc.childCount; i++) {
-        let height = virtualFlowHeightFor(view, doc.child(i));
-        if (offset < visibleBottom && offset + height > visibleTop) {
-            start = Math.min(start, i);
-            end = Math.max(end, i + 1);
-        }
-        offset += height;
-    }
-    return { start, end };
-}
-
-function ensureVirtualization(view) {
-    let options = virtualOptions(view);
-    if (!options || view.state.doc.childCount <= options.threshold) {
-        destroyVirtualization(view);
-        return null;
-    }
-    let state = view._virtualization, dematerialize = false;
-    if (!state) {
-        // The activation is deferred until the editor is in the document:
-        // while the element is detached there is no layout to measure, and
-        // the blocks outside the initial window have to be dematerialized
-        // once the layout is there.
-        let deferActivation = !view.docView || !view.dom.isConnected;
-        state = view._virtualization = {
-            options,
-            heights: new WeakMap(),
-            estimates: new WeakMap(),
-            heightAdjustments: new WeakMap(),
-            topLevelDescs: [],
-            calibration: new Map(),
-            width: view.dom.clientWidth || DEFAULT_CONTENT_WIDTH,
-            range: null,
-            activationPending: deferActivation,
-            activationRaf: null,
-            activationAttempts: 0,
-            topLevelChanged: true,
-        };
-        state.range = virtualRangeForBuild(view, view.state.doc);
-        state.docChildCount = view.state.doc.childCount;
-        attachVirtualScroll(view, state);
-        dematerialize = true;
-        // The constructor schedules the activation once the view is built.
-        // A state that appears later (the shared document arrives after the
-        // editor is mounted) has to schedule it here.
-        if (state.activationPending && view.docView)
-            scheduleVirtualActivation(view);
-    }
-    else {
-        let rangeChanged = state.docChildCount != view.state.doc.childCount ||
-            state.options.overscanPx != options.overscanPx;
-        state.options = options;
-        if (rangeChanged) {
-            state.docChildCount = view.state.doc.childCount;
-            state.topLevelChanged = true;
-        }
-    }
-    if (dematerialize && view.docView)
-        dematerializeRealDescs(view, state, { keepSelection: true });
-    return state;
-}
-
-function isTopLevelUpdater(updater, view) {
-    return updater.top.parent == null && updater.top.node.type == view.state.schema.topNodeType;
-}
-
-function shouldVirtualizeTopLevel(view, index) {
-    let state = view._virtualization;
-    return !!state && (index < state.range.start || index >= state.range.end);
-}
-
-function topLevelDescAtIndex(view, index) {
-    if (index < 0)
-        return null;
-    let state = view._virtualization;
-    let desc = state && state.topLevelDescs[index];
-    return desc && desc.parent == view.docView ? desc : null;
-}
-
-function createVirtualDOM(height, margins) {
-    let dom = document.createElement('div');
-    dom.className = VIRTUAL_PLACEHOLDER_CLASS;
-    dom.dataset.pmVirtual = 'true';
-    dom.setAttribute('aria-hidden', 'true');
-    dom.contentEditable = 'false';
-    dom.style.height = height + 'px';
-    applyVirtualMargins(dom, margins);
-    dom.style.overflow = 'hidden';
-    return dom;
-}
-
-function createVirtualDOMBatch(parentDOM, heights, margins) {
-    // Static numeric markup parses in one native operation; per-placeholder DOM calls dominate heavy mounts.
-    let markup = [];
-    for (let index = 0; index < heights.length; index++) {
-        let margin = margins && margins[index];
-        let marginStyle = margin
-            ? ';margin-top:' + margin.top + 'px;margin-bottom:' + margin.bottom + 'px'
-            : '';
-        markup.push('<div class="' + VIRTUAL_PLACEHOLDER_CLASS + '" data-pm-virtual="true" aria-hidden="true"' +
-            ' contenteditable="false" style="height:' + heights[index] + 'px' + marginStyle + ';overflow:hidden"></div>');
-    }
-    parentDOM.innerHTML = maybeWrapTrusted(markup.join(''));
-    return Array.from(parentDOM.children);
-}
-
-function selectionTopLevelIndexes(view) {
-    let doc = view.state.doc, selection = view.state.selection, indexes = new Set;
-    let positions = selection.anchor == selection.head
-        ? [selection.anchor]
-        : [selection.anchor, selection.head];
-    for (let pos of positions) {
-        let index = topLevelIndexAtPos(doc, pos);
-        if (index >= 0)
-            indexes.add(index);
-    }
-    return indexes;
-}
-
-function dematerializeRealDescs(view, state, options) {
-    let parent = view.docView;
-    if (!parent || !parent.children || !state.range)
-        return 0;
-    let keepSelection = options && options.keepSelection ? selectionTopLevelIndexes(view) : null;
-    let stale = [];
-    for (let index = 0; index < state.topLevelDescs.length; index++) {
-        let desc = state.topLevelDescs[index];
-        if (!desc || !desc.node || desc.virtual || desc.parent != parent)
-            continue;
-        let docIndex = desc.topLevelIndex;
-        if (docIndex == null)
-            docIndex = index;
-        if (docIndex >= state.range.start && docIndex < state.range.end)
-            continue;
-        if (keepSelection && keepSelection.has(docIndex))
-            continue;
-        stale.push({ desc, docIndex });
-    }
-    if (!stale.length)
-        return 0;
-    // Plan the swap before touching the DOM: a measured block turns into a
-    // placeholder with the same border box and the same margins, so the flow
-    // height does not change and no anchor correction is needed. Reading the
-    // geometry after the swap would force a layout, which is what makes
-    // structural edits expensive.
-    let plan = [], neutral = true;
-    for (let { desc, docIndex } of stale) {
-        if (!state.heights.has(desc.node)) {
-            let measured = desc.dom.getBoundingClientRect().height;
-            if (measured > 0) state.heights.set(desc.node, measured);
-        }
-        let margins = virtualMargins(state, desc.node);
-        if (!margins || state.heightAdjustments.get(desc.node)) neutral = false;
-        plan.push({ desc, docIndex, margins });
-    }
-    let anchor = neutral ? null : (options && options.anchor !== undefined
-        ? options.anchor
-        : captureVirtualAnchor(view)), changed = 0;
-    for (let { desc, docIndex, margins } of plan) {
-        let height = virtualHeight(view, desc.node);
-        let virtual = new VirtualNodeViewDesc(parent, desc.node, desc.outerDeco, desc.innerDeco,
-            createVirtualDOM(height, margins), height, view);
-        virtual.topLevelIndex = docIndex;
-        let childIndex = parent.children.indexOf(desc);
-        desc.destroy();
-        if (childIndex >= 0) parent.children[childIndex] = virtual;
-        state.topLevelDescs[docIndex] = virtual;
-        changed++;
-    }
-    let observer = view.domObserver, restartObserver = observer && observer.running;
-    if (restartObserver)
-        observer.stop();
-    try {
-        renderDescs(parent.contentDOM, parent.children, view);
-    }
-    finally {
-        if (restartObserver)
-            observer.start();
-    }
-    if (anchor)
-        restoreVirtualAnchor(view, anchor);
-    return changed;
-}
-
-function hasUsableLayout(view) {
-    return view.dom.getBoundingClientRect().height > 0 || view.dom.offsetHeight > 0;
-}
-
-// The binary search assumes that the rectangles grow with the index. A
-// block that is not in the document has no rectangle, and a placeholder
-// without a height has none either: both look like "inside the viewport"
-// to the search, which would report the whole document as visible.
-function virtualRangeRectUsable(desc, rect) {
-    if (!desc || !desc.dom || !desc.dom.parentNode)
-        return false;
-    if (desc.virtual && !(rect.height > 0))
-        return false;
-    return true;
-}
-
-function findVirtualRange(view, overscan) {
-    let children = view._virtualization && view._virtualization.topLevelDescs;
-    if (!children || !children.length)
-        return { start: 0, end: 0 };
-    let viewport = virtualViewport(view);
-    let top = viewport.top - overscan, bottom = viewport.bottom + overscan;
-    let low = 0, high = children.length - 1, start = children.length;
-    while (low <= high) {
-        let middle = (low + high) >> 1;
-        let desc = children[middle], rect = desc.dom.getBoundingClientRect();
-        if (!virtualRangeRectUsable(desc, rect))
-            return virtualRangeForDescs(view, children, overscan);
-        if (rect.bottom < top)
-            low = middle + 1;
-        else {
-            start = middle;
-            high = middle - 1;
-        }
-    }
-    if (start == children.length)
-        return { start, end: start };
-    low = start;
-    high = children.length - 1;
-    let end = start - 1;
-    while (low <= high) {
-        let middle = (low + high) >> 1;
-        let desc = children[middle], rect = desc.dom.getBoundingClientRect();
-        if (!virtualRangeRectUsable(desc, rect))
-            return virtualRangeForDescs(view, children, overscan);
-        if (rect.top > bottom)
-            high = middle - 1;
-        else {
-            end = middle;
-            low = middle + 1;
-        }
-    }
-    return { start, end: end + 1 };
-}
-
-function captureVirtualAnchor(view) {
-    let range = findVirtualRange(view, 0), descs = view._virtualization.topLevelDescs;
-    if (range.start >= descs.length)
-        return null;
-    let desc = descs[range.start];
-    // A block that is not in the document has no position: anchoring to it
-    // would move the scroll position once the block is materialized.
-    if (!desc || !desc.dom || !desc.dom.parentNode)
-        return null;
-    return {
-        index: range.start,
-        node: desc.node,
-        top: desc.dom.getBoundingClientRect().top,
-        scroller: virtualScroller(view),
-    };
-}
-
-function restoreVirtualAnchor(view, anchor) {
-    if (!anchor)
-        return;
-    let descs = view._virtualization.topLevelDescs;
-    let desc = descs[anchor.index];
-    // A structural edit can move the anchor to another index, so the block
-    // that was captured is looked up by its node.
-    if (!desc || anchor.node && desc.node !== anchor.node) {
-        desc = anchor.node ? descs.find(candidate => candidate && candidate.node === anchor.node) : null;
-        if (!desc)
-            return;
-    }
-    let delta = desc.dom.getBoundingClientRect().top - anchor.top;
-    if (Math.abs(delta) < .01)
-        return;
-    if (anchor.scroller.element)
-        anchor.scroller.element.scrollTop += delta;
-    else
-        anchor.scroller.window.scrollTo(anchor.scroller.window.scrollX, anchor.scroller.window.scrollY + delta);
-}
-
-function virtualScrollHeight(view) {
-    let scroller = virtualScroller(view);
-    return scroller.element
-        ? scroller.element.scrollHeight
-        : scroller.window.document.documentElement.scrollHeight;
-}
-
-function compensateVirtualHeight(state, result, delta) {
-    if (!delta || !result.length)
-        return;
-    let first = Infinity, last = -1;
-    for (let desc of result) {
-        let index = desc.topLevelIndex;
-        if (index == null)
-            continue;
-        first = Math.min(first, index);
-        last = Math.max(last, index);
-    }
-    if (first == Infinity)
-        return;
-    let adjust = desc => {
-        if (!desc || !desc.virtual || !desc.node)
-            return;
-        let height = desc.estimatedHeight, nextHeight;
-        if (delta > 0) {
-            let reduction = Math.min(height, delta);
-            nextHeight = height - reduction;
-            delta -= reduction;
-        }
-        else {
-            nextHeight = height - delta;
-            delta = 0;
-        }
-        let change = nextHeight - height;
-        if (!change)
-            return;
-        let adjustment = (state.heightAdjustments.get(desc.node) || 0) + change;
-        state.heightAdjustments.set(desc.node, adjustment);
-        desc.estimatedHeight = nextHeight;
-        desc.dom.style.height = nextHeight + 'px';
-    };
-    for (let index = last + 1; index < state.topLevelDescs.length && delta; index++)
-        adjust(state.topLevelDescs[index]);
-    for (let index = first - 1; index >= 0 && delta; index--)
-        adjust(state.topLevelDescs[index]);
-}
-
-// The flow height of a block that turns from a placeholder into a real block
-// changes unless the placeholder already occupied the same space. The cached
-// heights answer that without reading the scroll height back, which would
-// force a layout after the DOM was already changed.
-function virtualSwapDelta(state, desc) {
-    let node = desc.node;
-    if (!node)
-        return null;
-    let height = state.heights.get(node);
-    if (!(height > 0))
-        return null;
-    let margins = virtualMargins(state, node);
-    let realTop = margins ? margins.top : 0, realBottom = margins ? margins.bottom : 0;
-    let placeholderTop = Number.parseFloat(desc.dom.style.marginTop) || 0;
-    let placeholderBottom = Number.parseFloat(desc.dom.style.marginBottom) || 0;
-    if (placeholderTop != realTop || placeholderBottom != realBottom)
-        return null;
-    let placeholderHeight = Number.parseFloat(desc.dom.style.height) || 0;
-    return height - placeholderHeight;
-}
-
-// A block occupies its border box plus the margins the browser collapses
-// around it. The placeholder has to account for the same space, otherwise the
-// swap moves everything below it.
-function virtualFlowHeight(boxHeight, margins) {
-    let top = margins ? margins.top || 0 : 0, bottom = margins ? margins.bottom || 0 : 0;
-    return boxHeight + Math.max(top, bottom);
-}
-
-// The space a block takes in the flow: its border box plus the margins it
-// carries. The range math needs the flow height, the placeholder style needs
-// the border box.
-function virtualFlowHeightFor(view, node, boxHeight) {
-    let state = view._virtualization;
-    let box = boxHeight != null ? boxHeight : virtualHeight(view, node);
-    return virtualFlowHeight(box, virtualMargins(state, node));
-}
-
-function placeholderFlowHeight(dom) {
-    let boxHeight = Number.parseFloat(dom.style.height) || 0;
-    let top = Number.parseFloat(dom.style.marginTop) || 0;
-    let bottom = Number.parseFloat(dom.style.marginBottom) || 0;
-    return boxHeight + Math.max(top, bottom);
-}
-
-function materializeVirtualDescs(view, descs, options) {
-    let state = ensureVirtualization(view);
-    if (!state || !descs.length)
-        return [];
-    let unique = descs.filter((desc, index) => desc && desc.virtual && desc.parent &&
-        descs.indexOf(desc) == index);
-    if (!unique.length)
-        return [];
-    let modelDelta = 0, exact = true;
-    let placeholderFlows = new Map;
-    for (let desc of unique) {
-        let delta = virtualSwapDelta(state, desc);
-        if (delta == null) {
-            exact = false;
-            break;
-        }
-        modelDelta += delta;
-    }
-    for (let desc of unique)
-        placeholderFlows.set(desc, placeholderFlowHeight(desc.dom));
-    let neutral = exact && modelDelta == 0;
-    // The caller can hand in an anchor that was captured before it changed the
-    // DOM: capturing it here would read the layout after the mutation and
-    // force a second layout pass.
-    let anchor = neutral ? null : (options && options.anchor !== undefined
-        ? options.anchor
-        : captureVirtualAnchor(view));
-    let result = [], resultFlows = [], parent;
-    for (let desc of unique) {
-        parent = desc.parent;
-        let index = parent.children.indexOf(desc);
-        if (index < 0)
-            continue;
-        let pos = parent.posBeforeChild(desc);
-        let docIndex = desc.topLevelIndex;
-        if (docIndex == null)
-            docIndex = topLevelIndexAtPos(view.state.doc, pos);
-        let current = view.state.doc.child(docIndex);
-        if (current)
-            desc.node = current;
-        let real = NodeViewDesc.create(parent, desc.node, desc.outerDeco, desc.innerDeco, view, pos, -1, true);
-        if (!real || real.virtual)
-            continue;
-        real.topLevelIndex = docIndex;
-        state.topLevelDescs[docIndex] = real;
-        // The measured height replaces the estimate, so the compensation that
-        // was applied while this block was virtual no longer applies to it.
-        state.heightAdjustments.delete(real.node);
-        if (real.contentDOM)
-            real.updateChildren(view, pos + 1);
-        desc.destroy();
-        parent.children[index] = real;
-        result.push(real);
-        // The space the placeholder took is remembered for the compensation.
-        resultFlows.push(placeholderFlows.get(desc) || 0);
-    }
-    if (!result.length)
-        return [];
-    let observer = view.domObserver, restartObserver = observer && observer.running;
-    if (restartObserver)
-        observer.stop();
-    let delta = 0;
-    try {
-        renderDescs(parent.contentDOM, parent.children, view);
-        for (let index = 0; index < result.length; index++) {
-            let desc = result[index];
-            let height = state.heights.get(desc.node);
-            if (!(height > 0)) {
-                // Only blocks that were never measured need a layout read.
-                height = desc.dom.getBoundingClientRect().height;
-                if (height > 0) state.heights.set(desc.node, height);
-            }
-            if (height > 0) desc.estimatedHeight = height;
-            calibrateNodeHeight(view, desc);
-            if (!exact && height > 0) {
-                // The measured block replaces the estimate: the difference is
-                // the space the swap took or gave back. Without a measurement
-                // the swap size is unknown and nothing is compensated.
-                let margins = virtualMargins(state, desc.node);
-                delta += virtualFlowHeight(height, margins) - resultFlows[index];
-            }
-        }
-        if (exact)
-            delta = modelDelta;
-    }
-    finally {
-        if (restartObserver)
-            observer.start();
-    }
-    // The anchor is restored before the compensation writes: the restore
-    // reads the layout, and a style write would force another layout pass.
-    if (anchor) restoreVirtualAnchor(view, anchor);
-    // The compensation keeps the document height stable, so the scroll
-    // position does not have to be read back from the DOM.
-    if (delta)
-        compensateVirtualHeight(state, result, delta);
-    return result;
-}
-
-function materializeSelectionBlocks(view, force = false) {
-    let state = ensureVirtualization(view);
-    if (!state || state.activationPending && !force)
-        return;
-    let doc = view.state.doc, descs = [];
-    let positions = view.state.selection.anchor == view.state.selection.head
-        ? [view.state.selection.anchor]
-        : [view.state.selection.anchor, view.state.selection.head];
-    for (let pos of positions) {
-        let index = topLevelIndexAtPos(doc, pos);
-        let desc = topLevelDescAtIndex(view, index);
-        if (desc && desc.virtual)
-            descs.push(desc);
-    }
-    materializeVirtualDescs(view, descs);
-}
-
-function materializeVisibleBlocks(view) {
-    let state = ensureVirtualization(view);
-    if (!state)
-        return;
-    if (hasUsableLayout(view)) {
-        for (let pass = 0; pass < 20; pass++) {
-            let range = findVirtualRange(view, state.options.overscanPx);
-            state.range = range;
-            let descs = [];
-            for (let i = range.start; i < range.end; i++) {
-                let desc = state.topLevelDescs[i];
-                if (desc && desc.virtual)
-                    descs.push(desc);
-            }
-            if (!descs.length || !materializeVirtualDescs(view, descs).length)
-                break;
-        }
-    }
-    // Blocks the user scrolled past must not stay materialized: every later
-    // edit would have to tear them down and lay them out again. This also
-    // runs without a layout: the range of the last pass is enough to know
-    // which blocks are outside of it.
-    dematerializeRealDescs(view, state, { keepSelection: true });
-    state.topLevelChanged = false;
-}
-
-function activateVirtualization(view) {
-    let state = ensureVirtualization(view);
-    if (!state)
-        return;
-    if (!state.activationPending) {
-        materializeVisibleBlocks(view);
-        return;
-    }
-    if (!view.dom.isConnected && ++state.activationAttempts <= 60) {
-        // The editor element is still detached: there is no layout to
-        // measure, so the activation waits for the element to reach the
-        // document. Without the wait the blocks outside the range would
-        // stay materialized for good.
-        scheduleVirtualActivation(view);
-        return;
-    }
-    state.activationPending = false;
-    state.activationAttempts = 0;
-    if (state.activationRaf != null) {
-        cancelAnimationFrame(state.activationRaf);
-        state.activationRaf = null;
-    }
-    let scrollHeightBefore = virtualScrollHeight(view);
-    for (let desc of state.topLevelDescs)
-        if (desc && !desc.virtual) calibrateNodeHeight(view, desc);
-    let range = hasUsableLayout(view)
-        ? findVirtualRange(view, state.options.overscanPx)
-        : virtualRangeForDescs(view, state.topLevelDescs, state.options.overscanPx);
-    state.range = range;
-    materializeSelectionBlocks(view, true);
-    materializeVisibleBlocks(view);
-    let scrollHeightDelta = virtualScrollHeight(view) - scrollHeightBefore;
-    if (scrollHeightDelta) {
-        let anchor = captureVirtualAnchor(view);
-        let descs = state.topLevelDescs.slice(state.range.start, state.range.end);
-        compensateVirtualHeight(state, descs, scrollHeightDelta);
-        restoreVirtualAnchor(view, anchor);
-    }
-    if (!view.isDestroyed && view.hasFocus())
-        selectionToDOM(view);
-}
-
-function scheduleVirtualActivation(view) {
-    let state = view._virtualization;
-    if (!state || !state.activationPending || state.activationRaf != null)
-        return;
-    let raf = requestAnimationFrame(() => {
-        state.activationRaf = null;
-        if (view._virtualization !== state)
-            return;
-        activateVirtualization(view);
-    });
-    if (state.activationPending)
-        state.activationRaf = raf;
-}
-
 // Node view descs are the main, most common type of view desc, and
 // correspond to an actual node in the document. Unlike mark descs,
 // they populate their child array themselves.
@@ -2576,18 +1295,7 @@ class NodeViewDesc extends ViewDesc {
     // since it'd require exposing a whole slew of finicky
     // implementation details to the user code that they probably will
     // never need.)
-    static create(parent, node, outerDeco, innerDeco, view, pos, topLevelIndex = -1, forceReal = false) {
-        if (topLevelIndex >= 0 && !forceReal && shouldVirtualizeTopLevel(view, topLevelIndex)) {
-            let height = virtualHeight(view, node);
-            let state = view._virtualization;
-            let dom = createVirtualDOM(height);
-            applyVirtualMargins(dom, virtualMargins(state, node));
-            let desc = new VirtualNodeViewDesc(parent, node, outerDeco, innerDeco, dom, height, view);
-            desc.topLevelIndex = topLevelIndex;
-            if (state)
-                state.topLevelDescs[topLevelIndex] = desc;
-            return desc;
-        }
+    static create(parent, node, outerDeco, innerDeco, view, pos) {
         let custom = view.nodeViews[node.type.name], descObj;
         let spec = custom && custom(node, view, () => {
             // (This is a function that allows the custom view to find its
@@ -2616,20 +1324,12 @@ class NodeViewDesc extends ViewDesc {
         }
         let nodeDOM = dom;
         dom = applyOuterDeco(dom, outerDeco, node);
-        let desc;
         if (spec)
-            desc = descObj = new CustomNodeViewDesc(parent, node, outerDeco, innerDeco, dom, contentDOM || null, nodeDOM, spec);
+            return descObj = new CustomNodeViewDesc(parent, node, outerDeco, innerDeco, dom, contentDOM || null, nodeDOM, spec);
         else if (node.isText)
-            desc = new TextViewDesc(parent, node, outerDeco, innerDeco, dom, nodeDOM);
+            return new TextViewDesc(parent, node, outerDeco, innerDeco, dom, nodeDOM);
         else
-            desc = new NodeViewDesc(parent, node, outerDeco, innerDeco, dom, contentDOM || null, nodeDOM);
-        if (topLevelIndex >= 0) {
-            desc.topLevelIndex = topLevelIndex;
-            let state = view._virtualization;
-            if (state)
-                state.topLevelDescs[topLevelIndex] = desc;
-        }
-        return desc;
+            return new NodeViewDesc(parent, node, outerDeco, innerDeco, dom, contentDOM || null, nodeDOM);
     }
     parseRule(addedNodes) {
         // Experimental kludge to allow opt-in re-parsing of nodes
@@ -2670,6 +1370,7 @@ class NodeViewDesc extends ViewDesc {
         }
         return rule;
     }
+    // fork hook (virtualization): identity-only matching while virtualization is active; see src/virtualize/descs.js
     matchesNode(node, outerDeco, innerDeco, identityOnly = false) {
         let sameNode = identityOnly ? node == this.node : node.eq(this.node);
         return this.dirty == NOT_DIRTY && sameNode &&
@@ -2682,7 +1383,8 @@ class NodeViewDesc extends ViewDesc {
     // separate step, syncs the DOM inside `this.contentDOM` to
     // `this.children`.
     updateChildren(view, pos) {
-        if (!this.parent && view._virtualization && updateVirtualTopLevelChildren(this, view))
+        // fork hook (virtualization): structural top-level reconciliation; see src/virtualize/reconcile.js
+        if (!this.parent && view._virtualization && virtualization.updateVirtualTopLevelChildren(this, view))
             return;
         let inline = this.node.inlineContent, off = pos;
         let composition = view.composing ? this.localCompositionInfo(view, pos) : null;
@@ -2712,19 +1414,12 @@ class NodeViewDesc extends ViewDesc {
                 // Add it as a new view
                 updater.addNode(child, outerDeco, innerDeco, view, off);
             }
-            if (!this.parent) {
-                let desc = updater.top.children[updater.index - 1];
-                if (desc) {
-                    desc.topLevelIndex = i;
-                    let state = view._virtualization;
-                    if (state)
-                        state.topLevelDescs[i] = desc;
-                }
-            }
+            // fork hook (virtualization): track the top-level desc; see src/virtualize/descs.js
+            virtualization.trackTopLevelDesc(view, this, updater, i);
             off += child.nodeSize;
         });
-        if (!this.parent && view._virtualization)
-            view._virtualization.topLevelDescs.length = this.node.childCount;
+        // fork hook (virtualization): keep the top-level desc index in sync; see src/virtualize/descs.js
+        virtualization.syncTopLevelDescCount(view, this);
         // Drop all remaining descs after the current position.
         updater.syncToMarks([], inline, view, 0);
         if (this.node.isTextblock)
@@ -2736,10 +1431,8 @@ class NodeViewDesc extends ViewDesc {
             if (localComposition)
                 this.protectLocalComposition(view, localComposition);
             renderDescs(this.contentDOM, this.children, view);
-            if (!this.parent) {
-                for (let child of this.children)
-                    calibrateNodeHeight(view, child);
-            }
+            // fork hook (virtualization): calibrate materialized top-level heights; see src/virtualize/descs.js
+            virtualization.calibrateTopLevelChildren(view, this);
             if (ios)
                 iosHacks(this.dom);
         }
@@ -2798,8 +1491,8 @@ class NodeViewDesc extends ViewDesc {
     updateInner(node, outerDeco, innerDeco, view) {
         this.updateOuterDeco(outerDeco);
         this.node = node;
-        if (this.estimatedHeight && view._virtualization)
-            view._virtualization.heights.set(node, this.estimatedHeight);
+        // fork hook (virtualization): preserve the measured height; see src/virtualize/descs.js
+        virtualization.rememberEstimatedHeight(view, this, node);
         this.innerDeco = innerDeco;
         if (this.contentDOM)
             this.updateChildren(view, this.posAtStart);
@@ -2835,70 +1528,22 @@ class NodeViewDesc extends ViewDesc {
     }
     get domAtom() { return this.node.isAtom; }
 }
-class VirtualNodeViewDesc extends NodeViewDesc {
-    constructor(parent, node, outerDeco, innerDeco, dom, estimatedHeight, view) {
-        super(parent, node, outerDeco, innerDeco, dom, null, null);
-        this.virtual = true;
-        this.estimatedHeight = estimatedHeight;
-        this.view = view;
-        this.margins = null;
-    }
-    update(node, outerDeco, innerDeco, view) {
-        if (!view._virtualization)
-            return false;
-        let state = view._virtualization, oldNode = this.node;
-        copyVirtualNodeState(state, oldNode, node, sameVirtualNodeShape(oldNode, node));
-        this.node = node;
-        this.outerDeco = outerDeco;
-        this.innerDeco = innerDeco;
-        let height = virtualHeight(view, node);
-        if (this.estimatedHeight != height) {
-            this.estimatedHeight = height;
-            this.dom.style.height = height + 'px';
-        }
-        // The margins only change with the node type or the calibration, so
-        // the placeholder is not restyled on every reconciliation.
-        let margins = virtualMargins(state, node);
-        if (this.margins !== margins) {
-            applyVirtualMargins(this.dom, margins);
-            this.margins = margins;
-        }
-        this.dirty = NOT_DIRTY;
-        return true;
-    }
-    matchesNode(node, outerDeco, innerDeco) {
-        if (!this.view._virtualization || this.dirty != NOT_DIRTY)
-            return false;
-        let sameNode = this.node == node || sameVirtualNodeShape(this.node, node);
-        return sameNode && sameOuterDeco(outerDeco, this.outerDeco) && innerDeco.eq(this.innerDeco);
-    }
-    destroy() {
-        this.parent = undefined;
-        if (this.dom.pmViewDesc == this)
-            this.dom.pmViewDesc = undefined;
-    }
-    selectNode() {}
-    deselectNode() {}
-    descAt(pos) {
-        // Keep virtual blocks addressable so nodeDOM can return null without losing their range.
-        return pos >= 0 && pos < this.size ? this : undefined;
-    }
-    localPosFromDOM(dom, offset, bias) {
-        let start = this.posAtStart, end = this.posAtEnd;
-        // A placeholder click has no text offset, so materialize and use the nearest block edge.
-        materializeVirtualDescs(this.view, [this]);
-        return bias > 0 ? end : start;
-    }
-    domFromPos(pos, side) {
-        // Upstream callers expect real content DOM here, so materialize instead of exposing the placeholder.
-        let real = materializeVirtualDescs(this.view, [this])[0];
-        return real ? real.domFromPos(pos, side) : { node: this.dom, offset: 0 };
-    }
-}
+// fork hook (virtualization): expose upstream internals to the fork modules; see src/virtualize/runtime.js
+virtualization.configureVirtualization({
+    NodeViewDesc,
+    WidgetViewDesc,
+    NOT_DIRTY,
+    sameOuterDeco,
+    iterDeco,
+    renderDescs,
+    maybeWrapTrusted,
+    selectionToDOM,
+});
 // Create a view desc for the top-level document node, to be exported
 // and used by the view class.
 function docViewDesc(doc, outerDeco, innerDeco, dom, view) {
-    ensureVirtualization(view);
+    // fork hook (virtualization): initialize state before building the document desc; see src/virtualize/activation.js
+    virtualization.ensureVirtualization(view);
     applyOuterDeco(dom, outerDeco, doc);
     let docView = new NodeViewDesc(undefined, doc, outerDeco, innerDeco, dom, dom, dom);
     if (docView.contentDOM)
@@ -3337,8 +1982,10 @@ class ViewTreeUpdater {
             !next.node.content.eq(node.content) ||
             !sameOuterDeco(outerDeco, next.outerDeco) || !innerDeco.eq(next.innerDeco))
             return null;
-        let topLevelIndex = isTopLevelUpdater(this, view) ? topLevelIndexAtPos(view.state.doc, pos) : -1;
-        let wrapper = NodeViewDesc.create(this.top, node, outerDeco, innerDeco, view, pos, topLevelIndex, true);
+        // fork hook (virtualization): preserve top-level identity on wrapper recreation; see src/virtualize/descs.js
+        let topLevelIndex = virtualization.topLevelIndexForUpdater(this, view, pos);
+        let wrapper = virtualization.createNodeDesc(this.top, node, outerDeco, innerDeco, view, pos,
+            { topLevelIndex, forceReal: true });
         if (wrapper.contentDOM) {
             wrapper.children = next.children;
             next.children = [];
@@ -3350,8 +1997,10 @@ class ViewTreeUpdater {
     }
     // Insert the node as a newly created node desc.
     addNode(node, outerDeco, innerDeco, view, pos) {
-        let topLevelIndex = isTopLevelUpdater(this, view) ? topLevelIndexAtPos(view.state.doc, pos) : -1;
-        let desc = NodeViewDesc.create(this.top, node, outerDeco, innerDeco, view, pos, topLevelIndex);
+        // fork hook (virtualization): create a placeholder for off-screen top-level nodes; see src/virtualize/descs.js
+        let topLevelIndex = virtualization.topLevelIndexForUpdater(this, view, pos);
+        let desc = virtualization.createNodeDesc(this.top, node, outerDeco, innerDeco, view, pos,
+            { topLevelIndex });
         if (desc.contentDOM)
             desc.updateChildren(view, pos + 1);
         this.top.children.splice(this.index++, 0, desc);
@@ -4806,6 +3455,7 @@ class LeftMouseDown extends MouseDown {
         }
         const target = flushed ? null : event.target;
         const targetDesc = target ? view.docView.nearestDesc(target, true) : null;
+        // fork hook (virtualization): virtual descs have no node DOM; see src/virtualize/descs.js
         this.target = targetDesc && targetDesc.nodeDOM && targetDesc.nodeDOM.nodeType == 1 ? targetDesc.nodeDOM : null;
         let { selection } = view.state;
         if (event.button == 0 &&
@@ -6056,6 +4706,7 @@ class DOMObserver {
         this.handleDOMChange = handleDOMChange;
         this.queue = [];
         this.flushingSoon = -1;
+        // fork hook (virtualization): track observer state for safe DOM swaps; see src/virtualize/materialize.js
         this.running = false;
         this.observer = null;
         this.currentSelection = new SelectionState;
@@ -6105,6 +4756,7 @@ class DOMObserver {
         }
     }
     start() {
+        // fork hook (virtualization): track observer state for safe DOM swaps; see src/virtualize/materialize.js
         this.running = true;
         if (this.observer) {
             this.observer.takeRecords();
@@ -6115,6 +4767,7 @@ class DOMObserver {
         this.connectSelection();
     }
     stop() {
+        // fork hook (virtualization): track observer state for safe DOM swaps; see src/virtualize/materialize.js
         this.running = false;
         if (this.observer) {
             let take = this.observer.takeRecords();
@@ -6866,14 +5519,15 @@ class EditorView {
         this.editable = getEditable(this);
         updateCursorWrapper(this);
         this.nodeViews = buildNodeViews(this);
-        this._virtualization = null;
-        ensureVirtualization(this);
+        // fork hook (virtualization): initialize state before building the document desc; see src/virtualize/activation.js
+        virtualization.initializeVirtualization(this);
         this.docView = docViewDesc(this.state.doc, computeDocDeco(this), viewDecorations(this), this.dom, this);
         this.domObserver = new DOMObserver(this, (from, to, typeOver, added) => readDOMChange(this, from, to, typeOver, added));
         this.domObserver.start();
         initInput(this);
         this.updatePluginViews();
-        scheduleVirtualActivation(this);
+        // fork hook (virtualization): defer activation until the editor is laid out; see src/virtualize/activation.js
+        virtualization.scheduleVirtualActivation(this);
     }
     /**
     Holds `true` when a
@@ -6940,7 +5594,8 @@ class EditorView {
             updateSel = true;
         }
         this.state = state;
-        let virtualState = ensureVirtualization(this);
+        // fork hook (virtualization): prepare virtual state and selection deferral; see src/virtualize/activation.js
+        let virtualUpdate = virtualization.prepareVirtualUpdate(this, prev, state);
         let pluginsChanged = prev.plugins != state.plugins || this._props.plugins != prevProps.plugins;
         if (pluginsChanged || this._props.plugins != prevProps.plugins || this._props.nodeViews != prevProps.nodeViews) {
             let nodeViews = buildNodeViews(this);
@@ -6957,12 +5612,12 @@ class EditorView {
         let innerDeco = viewDecorations(this), outerDeco = computeDocDeco(this);
         let scroll = prev.plugins != state.plugins && !prev.doc.eq(state.doc) ? "reset"
             : state.scrollToSelection > prev.scrollToSelection ? "to selection" : "preserve";
-        let updateDoc = redraw || !this.docView.matchesNode(state.doc, outerDeco, innerDeco, !!virtualState);
-        let selectionChanged = !state.selection.eq(prev.selection);
-        if (updateDoc || selectionChanged)
+        // fork hook (virtualization): identity-only root matching avoids scanning the whole document; see src/virtualize/descs.js
+        let updateDoc = redraw || !this.docView.matchesNode(state.doc, outerDeco, innerDeco, !!virtualUpdate.virtualState);
+        if (updateDoc || virtualUpdate.selectionChanged)
             updateSel = true;
-        let deferSelection = !!(virtualState && virtualState.activationPending && !selectionChanged);
-        let oldScrollPos = !deferSelection && scroll == "preserve" && updateSel &&
+        // fork hook (virtualization): defer selection work until activation; see src/virtualize/activation.js
+        let oldScrollPos = !virtualUpdate.deferSelection && scroll == "preserve" && updateSel &&
             this.dom.style.overflowAnchor == null && storeScrollPos(this);
         if (updateSel) {
             this.domObserver.stop();
@@ -6989,24 +5644,22 @@ class EditorView {
                 if (chromeKludge && (!this.trackWrites || !this.dom.contains(this.trackWrites)))
                     forceSelUpdate = true;
             }
-            if (!deferSelection) {
-                materializeSelectionBlocks(this, selectionChanged);
-                if (virtualState && virtualState.topLevelChanged && !virtualState.activationPending)
-                    materializeVisibleBlocks(this);
-                // Work around for an issue where an update arriving right between
-                // a DOM selection change and the "selectionchange" event for it
-                // can cause a spurious DOM selection update, disrupting mouse
-                // drag selection.
-                let mouseDown = this.input.mouseDown;
-                if (forceSelUpdate ||
-                    !(mouseDown && this.domObserver.currentSelection.eq(this.domSelectionRange()) &&
-                        anchorInRightPlace(this) && mouseDown.delaySelUpdate())) {
-                    selectionToDOM(this, forceSelUpdate);
-                }
-                else {
-                    syncNodeSelection(this, state.selection);
-                    this.domObserver.setCurSelection();
-                }
+            // fork hook (virtualization): materialize selection/visible blocks before selection DOM work; see src/virtualize/activation.js
+            virtualization.materializeForSelection(this, virtualUpdate);
+            // Work around for an issue where an update arriving right between
+            // a DOM selection change and the "selectionchange" event for it
+            // can cause a spurious DOM selection update, disrupting mouse
+            // drag selection.
+            let mouseDown = this.input.mouseDown;
+            // fork hook (virtualization): skip selection DOM work while activation is deferred; see src/virtualize/activation.js
+            if (!virtualUpdate.deferSelection && (forceSelUpdate ||
+                !(mouseDown && this.domObserver.currentSelection.eq(this.domSelectionRange()) &&
+                    anchorInRightPlace(this) && mouseDown.delaySelUpdate()))) {
+                selectionToDOM(this, forceSelUpdate);
+            }
+            else if (!virtualUpdate.deferSelection) {
+                syncNodeSelection(this, state.selection);
+                this.domObserver.setCurSelection();
             }
             this.domObserver.start();
         }
@@ -7264,8 +5917,9 @@ class EditorView {
     views](https://prosemirror.net/docs/ref/#view.NodeView).
     */
     destroy() {
+        // fork hook (virtualization): release virtual state and listeners; see src/virtualize/activation.js
         if (!this.docView) {
-            destroyVirtualization(this);
+            virtualization.destroyVirtualization(this);
             return;
         }
         destroyInput(this);
@@ -7279,7 +5933,8 @@ class EditorView {
         }
         this.docView.destroy();
         this.docView = null;
-        destroyVirtualization(this);
+        // fork hook (virtualization): release virtual state and listeners; see src/virtualize/activation.js
+        virtualization.destroyVirtualization(this);
         clearReusedRange();
     }
     /**
@@ -7387,13 +6042,6 @@ function checkStateComponent(plugin) {
         throw new RangeError("Plugins passed directly to the view must not have a state component");
 }
 
-// `__findVirtualRange` is exported for the virtualization contract tests: it
-// is the range the view measures over the top-level blocks.
-export {
-  Decoration,
-  DecorationSet,
-  EditorView,
-  __endComposition,
-  findVirtualRange as __findVirtualRange,
-  __parseFromClipboard,
-};
+// fork hook (virtualization): test-only range export; see src/virtualize/viewport.js
+const __findVirtualRange = virtualization.findVirtualRange;
+export { Decoration, DecorationSet, EditorView, __endComposition, __findVirtualRange, __parseFromClipboard };

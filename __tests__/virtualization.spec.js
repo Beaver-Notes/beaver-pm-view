@@ -12,7 +12,7 @@ import {
 } from '@tiptap/y-tiptap';
 import * as Y from 'yjs';
 import { describe, expect, it, vi } from 'vitest';
-import { Decoration, DecorationSet, EditorView, __findVirtualRange } from '../index.js';
+import { Decoration, DecorationSet, EditorView, __findVirtualRange } from '../src/index.js';
 
 const schema = new Schema({
   nodes: {
