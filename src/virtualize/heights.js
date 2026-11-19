@@ -20,6 +20,7 @@ import {
     MIN_TABLE_ROW_HEIGHT,
     TABLE_ROW_SAMPLE_LIMIT,
 } from './constants.js';
+import { recordVirtual } from './perf.js';
 
 export function virtualCalibrationKey(node) {
     if (node.type.name == 'heading')
@@ -231,6 +232,8 @@ function refreshVirtualEstimates(view, state, key) {
     let children = state.topLevelDescs;
     if (!children)
         return;
+    let start = performance.now(), changed = 0;
+    let pending = state.pendingVirtualHeightWrites || (state.pendingVirtualHeightWrites = []);
     for (let desc of children) {
         if (!desc || !desc.virtual || !desc.node || virtualCalibrationKey(desc.node) != key)
             continue;
@@ -238,8 +241,25 @@ function refreshVirtualEstimates(view, state, key) {
             state.estimates.set(desc.node, estimateNodeHeight(view, desc.node));
         let height = virtualHeight(view, desc.node);
         desc.estimatedHeight = height;
-        desc.dom.style.height = height + 'px';
-        applyVirtualMargins(desc.dom, virtualMargins(state, desc.node));
+        pending.push({ desc, height, margins: virtualMargins(state, desc.node) });
+        changed++;
+    }
+    recordVirtual(view, 'heights.refreshVirtualEstimates', performance.now() - start);
+    recordVirtual(view, 'heights.refreshVirtualEstimates.blocks', changed);
+}
+
+export function commitVirtualHeights(view) {
+    let state = view && view._virtualization;
+    let pending = state && state.pendingVirtualHeightWrites;
+    if (!pending || !pending.length)
+        return;
+    state.pendingVirtualHeightWrites = [];
+    let latest = new Map;
+    for (let write of pending)
+        latest.set(write.desc, write);
+    for (let write of latest.values()) {
+        write.desc.dom.style.height = write.height + 'px';
+        applyVirtualMargins(write.desc.dom, write.margins);
     }
 }
 

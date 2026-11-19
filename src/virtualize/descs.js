@@ -6,7 +6,13 @@ import {
     virtualHeight,
     virtualMargins,
 } from './heights.js';
-import { createVirtualDOM } from './placeholders.js';
+import {
+    createVirtualDOM,
+    registerReusableDOM,
+    reusableNode,
+    restoreVirtualDOM,
+    virtualDOMState,
+} from './placeholders.js';
 import { forkRuntime } from './runtime.js';
 
 let VirtualNodeViewDesc;
@@ -19,12 +25,15 @@ export function configureDescs() {
             this.estimatedHeight = estimatedHeight;
             this.view = view;
             this.margins = null;
+            this.reusable = !!(dom && virtualDOMState(dom) && virtualDOMState(dom).reusable);
         }
         update(node, outerDeco, innerDeco, view) {
             if (!view._virtualization)
                 return false;
             let state = view._virtualization, oldNode = this.node;
             copyVirtualNodeState(state, oldNode, node, sameVirtualNodeShape(oldNode, node));
+            if (!node.sameMarkup(oldNode) || outerDeco && outerDeco.length)
+                this.reusable = false;
             this.node = node;
             this.outerDeco = outerDeco;
             this.innerDeco = innerDeco;
@@ -83,8 +92,7 @@ export function createNodeDesc(parent, node, outerDeco, innerDeco, view, pos, op
     if (topLevelIndex >= 0 && !options.forceReal && shouldVirtualizeTopLevel(view, topLevelIndex)) {
         let height = virtualHeight(view, node);
         let state = view._virtualization;
-        let dom = createVirtualDOM(height);
-        applyVirtualMargins(dom, virtualMargins(state, node));
+        let dom = createVirtualDOM(height, virtualMargins(state, node), { node, view, outerDeco });
         let desc = createVirtualDesc(parent, node, outerDeco, innerDeco, dom, height, view);
         desc.topLevelIndex = topLevelIndex;
         if (state)
@@ -92,9 +100,26 @@ export function createNodeDesc(parent, node, outerDeco, innerDeco, view, pos, op
         return desc;
     }
     let desc = forkRuntime.NodeViewDesc.create(parent, node, outerDeco, innerDeco, view, pos);
+    if (reusableNode(node, view, outerDeco) && desc.contentDOM === desc.dom) {
+        registerReusableDOM(desc.dom);
+        desc.reusable = true;
+    }
     if (topLevelIndex >= 0)
         registerTopLevelDesc(view, desc, topLevelIndex);
     return desc;
+}
+
+export function createRealDescFromVirtual(parent, desc) {
+    if (!desc.reusable || desc.outerDeco && desc.outerDeco.length)
+        return null;
+    let state = virtualDOMState(desc.dom);
+    if (!state || !state.reusable || state.contentDOM !== desc.dom)
+        return null;
+    restoreVirtualDOM(desc.dom);
+    let real = new forkRuntime.NodeViewDesc(
+        parent, desc.node, desc.outerDeco, desc.innerDeco, desc.dom, desc.dom, desc.dom);
+    real.reusable = true;
+    return real;
 }
 
 export function shouldVirtualizeTopLevel(view, index) {

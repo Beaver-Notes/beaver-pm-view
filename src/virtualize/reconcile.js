@@ -1,7 +1,7 @@
 import { MAX_FAST_PATH_BLOCKS } from './constants.js';
 import {
-    applyVirtualMargins,
     calibrateNodeHeight,
+    commitVirtualHeights,
     copyVirtualNodeState,
     sameVirtualNodeShape,
     virtualHeight,
@@ -16,6 +16,7 @@ import {
     captureVirtualAnchor,
     findVirtualRange,
     hasUsableLayout,
+    restoreVirtualAnchor,
     virtualRangeForDescs,
 } from './viewport.js';
 
@@ -175,7 +176,8 @@ export function updateVirtualTopLevelChildren(parent, view) {
             heights.push(virtualHeight(view, nodes[index]));
             margins.push(virtualMargins(state, nodes[index]));
         }
-        initialPlaceholderDOMs = createVirtualDOMBatch(parent.contentDOM, heights, margins);
+        initialPlaceholderDOMs = createVirtualDOMBatch(
+            parent.contentDOM, heights, margins, nodes, view, outerDecos);
     }
 
     let nextNodeDescs = [], nextChildren = [];
@@ -190,10 +192,10 @@ export function updateVirtualTopLevelChildren(parent, view) {
             }
             else {
                 let height = virtualHeight(view, node);
-                let dom = initialPlaceholderDOMs ? initialPlaceholderDOMs[index] : createVirtualDOM(height);
-                // A placeholder carries the margins of the block it stands in
-                // for, so the swap does not change the flow height.
-                applyVirtualMargins(dom, virtualMargins(state, node));
+                let dom = initialPlaceholderDOMs ? initialPlaceholderDOMs[index]
+                    : createVirtualDOM(height, virtualMargins(state, node), {
+                        node, view, outerDeco: outerDecos[index],
+                    });
                 desc = createVirtualDesc(parent, node, outerDecos[index], innerDecos[index], dom, height, view);
             }
         }
@@ -223,8 +225,9 @@ export function updateVirtualTopLevelChildren(parent, view) {
                 let childIndex = parent.children.indexOf(desc);
                 desc.destroy();
                 let height = virtualHeight(view, nodes[index]);
-                let dom = createVirtualDOM(height);
-                applyVirtualMargins(dom, virtualMargins(state, nodes[index]));
+                let dom = createVirtualDOM(height, virtualMargins(state, nodes[index]), {
+                    node: nodes[index], view, outerDeco: outerDecos[index],
+                });
                 desc = createVirtualDesc(parent, nodes[index], outerDecos[index], innerDecos[index],
                     dom, height, view);
                 desc.topLevelIndex = index;
@@ -260,7 +263,12 @@ export function updateVirtualTopLevelChildren(parent, view) {
         let rendered = state.topLevelDescs.every(desc => desc && desc.dom && desc.dom.parentNode == parent.contentDOM);
         if (rendered && hasUsableLayout(view)) {
             range = findVirtualRange(view, state.options.overscanPx);
-            anchor = captureVirtualAnchor(view);
+            // The dispatch already captured one anchor before this
+            // transaction's first write; a second read would force another
+            // layout pass.
+            anchor = view._virtualDispatchAnchor !== undefined
+                ? view._virtualDispatchAnchor
+                : captureVirtualAnchor(view);
         }
         else {
             // The rebuilt blocks are not in the document yet, so the layout
@@ -292,7 +300,12 @@ export function updateVirtualTopLevelChildren(parent, view) {
                 let desc = state.topLevelDescs[index];
                 if (desc && desc.virtual) entering.push(desc);
             }
-            materializeVirtualDescs(view, entering, { anchor });
+            if (entering.length)
+                materializeVirtualDescs(view, entering, { anchor });
+            else
+                commitVirtualHeights(view);
+            if (anchor)
+                restoreVirtualAnchor(view, anchor);
             state.topLevelChanged = false;
         }
     }

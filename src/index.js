@@ -1542,6 +1542,7 @@ class NodeViewDesc extends ViewDesc {
 }
 // fork hook (virtualization): expose upstream internals to the fork modules; see src/virtualize/runtime.js
 virtualization.configureVirtualization({
+    DOMSerializer,
     NodeViewDesc,
     WidgetViewDesc,
     NOT_DIRTY,

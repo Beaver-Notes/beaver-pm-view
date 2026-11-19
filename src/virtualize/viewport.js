@@ -1,4 +1,20 @@
 import { virtualHeight, virtualMargins } from './heights.js';
+import { timeVirtual } from './perf.js';
+
+// The space a block takes in the flow, taken from the heights the DOM already
+// carries: the inline style of a placeholder, the recorded measurement of a
+// real block. Never reads layout, so it can be used after the writes.
+function virtualModelFlowHeight(view, desc) {
+    if (!desc || !desc.node)
+        return 0;
+    let state = view._virtualization;
+    let box = desc.virtual
+        ? Number.parseFloat(desc.dom.style.height) || 0
+        : state.heights.get(desc.node) || virtualHeight(view, desc.node);
+    let margins = virtualMargins(state, desc.node);
+    let top = margins ? margins.top || 0 : 0, bottom = margins ? margins.bottom || 0 : 0;
+    return box + Math.max(top, bottom);
+}
 
 export function virtualScroller(view) {
     for (let element = view.dom; element && element.nodeType == 1; element = element.parentElement) {
@@ -90,6 +106,14 @@ function virtualRangeRectUsable(desc, rect) {
 }
 
 export function findVirtualRange(view, overscan) {
+    return timeVirtual(view, 'viewport.findVirtualRange', () => findVirtualRangeInner(view, overscan));
+}
+
+function descRect(view, desc) {
+    return timeVirtual(view, 'viewport.rectRead', () => desc.dom.getBoundingClientRect());
+}
+
+function findVirtualRangeInner(view, overscan) {
     let children = view._virtualization && view._virtualization.topLevelDescs;
     if (!children || !children.length)
         return { start: 0, end: 0 };
@@ -98,7 +122,7 @@ export function findVirtualRange(view, overscan) {
     let low = 0, high = children.length - 1, start = children.length;
     while (low <= high) {
         let middle = (low + high) >> 1;
-        let desc = children[middle], rect = desc.dom.getBoundingClientRect();
+        let desc = children[middle], rect = descRect(view, desc);
         if (!virtualRangeRectUsable(desc, rect))
             return virtualRangeForDescs(view, children, overscan);
         if (rect.bottom < top)
@@ -115,7 +139,7 @@ export function findVirtualRange(view, overscan) {
     let end = start - 1;
     while (low <= high) {
         let middle = (low + high) >> 1;
-        let desc = children[middle], rect = desc.dom.getBoundingClientRect();
+        let desc = children[middle], rect = descRect(view, desc);
         if (!virtualRangeRectUsable(desc, rect))
             return virtualRangeForDescs(view, children, overscan);
         if (rect.top > bottom)
@@ -128,8 +152,8 @@ export function findVirtualRange(view, overscan) {
     return { start, end: end + 1 };
 }
 
-export function captureVirtualAnchor(view) {
-    let range = findVirtualRange(view, 0), descs = view._virtualization.topLevelDescs;
+export function captureVirtualAnchor(view, range = findVirtualRange(view, 0)) {
+    let state = view._virtualization, descs = state.topLevelDescs;
     if (range.start >= descs.length)
         return null;
     let desc = descs[range.start];
@@ -137,10 +161,17 @@ export function captureVirtualAnchor(view) {
     // would move the scroll position once the block is materialized.
     if (!desc || !desc.dom || !desc.dom.parentNode)
         return null;
+    // The flow heights from the document start up to the anchor are known
+    // without a layout read, so the restore can compute where the anchor
+    // moved to without reading the DOM after the writes.
+    let offset = 0;
+    for (let index = 0; index < range.start; index++)
+        offset += virtualModelFlowHeight(view, descs[index]);
     return {
         index: range.start,
         node: desc.node,
         top: desc.dom.getBoundingClientRect().top,
+        offset,
         scroller: virtualScroller(view),
     };
 }
@@ -148,7 +179,14 @@ export function captureVirtualAnchor(view) {
 export function restoreVirtualAnchor(view, anchor) {
     if (!anchor)
         return;
-    let descs = view._virtualization.topLevelDescs;
+    // Within one dispatch only the first restore reads layout. Later passes
+    // reuse the same anchor, so their reads would only force another reflow.
+    if (view._virtualDispatchAnchor !== undefined) {
+        if (view._virtualAnchorRestored)
+            return;
+        view._virtualAnchorRestored = true;
+    }
+    let state = view._virtualization, descs = state.topLevelDescs;
     let desc = descs[anchor.index];
     // A structural edit can move the anchor to another index, so the block
     // that was captured is looked up by its node.
@@ -157,6 +195,9 @@ export function restoreVirtualAnchor(view, anchor) {
         if (!desc)
             return;
     }
+    // One geometry read for the whole batch: the model sum is only exact when
+    // every block above the anchor has a measured height, which is not true
+    // while activation and deferred measurement are still filling heights in.
     let delta = desc.dom.getBoundingClientRect().top - anchor.top;
     if (Math.abs(delta) < .01)
         return;

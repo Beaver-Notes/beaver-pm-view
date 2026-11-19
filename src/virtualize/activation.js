@@ -1,5 +1,11 @@
-import { DEFAULT_CONTENT_WIDTH, SCROLL_MATERIALIZATION_BUDGET_MS } from './constants.js';
-import { compensateVirtualHeight, dematerializeRealDescs, hasStaleRealDescs, materializeVirtualDescs } from './materialize.js';
+import { DEFAULT_CONTENT_WIDTH, SCROLL_BATCH_SIZE, SCROLL_MATERIALIZATION_BUDGET_MS, SCROLL_MATERIALIZATION_MAX_PER_FRAME } from './constants.js';
+import {
+    compensateVirtualHeight,
+    dematerializeRealDescs,
+    hasStaleRealDescs,
+    materializeVirtualDescs,
+    readPendingVirtualMeasurements,
+} from './materialize.js';
 import { forkRuntime } from './runtime.js';
 import { topLevelDescAtIndex, topLevelIndexAtPos, virtualOptions } from './state.js';
 import {
@@ -12,7 +18,8 @@ import {
     virtualScroller,
     virtualScrollHeight,
 } from './viewport.js';
-import { calibrateNodeHeight } from './heights.js';
+import { calibrateNodeHeight, commitVirtualHeights } from './heights.js';
+import { timeVirtual } from './perf.js';
 
 export function destroyVirtualization(view) {
     let state = view._virtualization;
@@ -20,6 +27,8 @@ export function destroyVirtualization(view) {
         return;
     if (state.scrollRaf != null)
         cancelAnimationFrame(state.scrollRaf);
+    if (state.measureRaf != null)
+        cancelAnimationFrame(state.measureRaf);
     state.scrollToken = null;
     if (state.activationRaf != null)
         cancelAnimationFrame(state.activationRaf);
@@ -35,10 +44,15 @@ function attachVirtualScroll(view, state) {
     state.scrollTarget.addEventListener('scroll', state.scrollHandler, { passive: true });
 }
 
-function scheduleVirtualScroll(view) {
+function scheduleVirtualScroll(view, continuation = false) {
     let state = view._virtualization;
     if (!state || state.scrollRaf != null)
         return;
+    // A new scroll burst means the viewport moved: the cached range from the
+    // previous burst no longer describes what the user can see. Continuation
+    // frames finish work inside the same burst and keep the measured range.
+    if (!continuation)
+        state.scrollRange = null;
     let token = state.scrollToken = {};
     let raf = requestAnimationFrame(() => {
         if (state.scrollToken !== token)
@@ -47,8 +61,20 @@ function scheduleVirtualScroll(view) {
         state.scrollRaf = null;
         if (view.isDestroyed || view._virtualization !== state)
             return;
-        if (materializeVisibleBlocksForScroll(view))
-            scheduleVirtualScroll(view);
+        state.inScrollFrame = true;
+        let again = false;
+        try {
+            again = materializeVisibleBlocksForScroll(view);
+        }
+        finally {
+            state.inScrollFrame = false;
+        }
+        // Scroll frames defer their height reads. Flush them in a later frame
+        // so the model converges on the real layout after a scroll burst.
+        if (state.pendingVirtualMeasurements && state.pendingVirtualMeasurements.length)
+            state.scheduleMeasurements();
+        if (again)
+            scheduleVirtualScroll(view, true);
     });
     // A synchronous requestAnimationFrame implementation runs the callback
     // before it returns the id.
@@ -74,6 +100,8 @@ export function ensureVirtualization(view) {
             heights: new WeakMap(),
             estimates: new WeakMap(),
             heightAdjustments: new WeakMap(),
+            pendingVirtualHeightWrites: [],
+            pendingVirtualMeasurements: [],
             topLevelDescs: [],
             calibration: new Map(),
             tableRowSamples: [],
@@ -84,11 +112,47 @@ export function ensureVirtualization(view) {
             activationAttempts: 0,
             scrollRaf: null,
             scrollToken: null,
+            measureRaf: null,
+            measureAttempts: 0,
             scrollCleanupPending: false,
             topLevelChanged: true,
         };
         state.range = virtualRangeForBuild(view, view.state.doc);
         state.docChildCount = view.state.doc.childCount;
+        // A block that was materialized inside a scroll frame is measured in
+        // a later frame: a layout read right after those DOM writes would
+        // force a synchronous relayout of the whole document.
+        state.scheduleMeasurements = function () {
+            if (state.measureRaf != null || view.isDestroyed)
+                return;
+            state.measureRaf = requestAnimationFrame(() => {
+                state.measureRaf = null;
+                if (view.isDestroyed || view._virtualization !== state)
+                    return;
+                // Compensation must not lower placeholders that are about to
+                // turn real: that adjustment is dropped on materialization.
+                let restoreRange = state.scrollCompensationRange;
+                state.scrollCompensationRange = state.scrollRange && state.scrollRange.target;
+                try {
+                    readPendingVirtualMeasurements(view);
+                    commitVirtualHeights(view);
+                }
+                finally {
+                    state.scrollCompensationRange = restoreRange;
+                }
+                if (state.pendingVirtualMeasurements.length) {
+                    // A block that still has no box (detached, not yet laid
+                    // out) is retried a few times, then dropped.
+                    state.measureAttempts++;
+                    if (state.measureAttempts < 8)
+                        state.scheduleMeasurements();
+                    else
+                        state.pendingVirtualMeasurements = [];
+                }
+                else
+                    state.measureAttempts = 0;
+            });
+        };
         attachVirtualScroll(view, state);
         dematerialize = true;
         // The constructor schedules the activation once the view is built.
@@ -111,7 +175,7 @@ export function ensureVirtualization(view) {
     return state;
 }
 
-export function materializeSelectionBlocks(view, force = false) {
+export function materializeSelectionBlocks(view, force = false, options) {
     let state = ensureVirtualization(view);
     if (!state || state.activationPending && !force)
         return;
@@ -125,18 +189,49 @@ export function materializeSelectionBlocks(view, force = false) {
         if (desc && desc.virtual)
             descs.push(desc);
     }
-    materializeVirtualDescs(view, descs);
+    materializeVirtualDescs(view, descs, options);
 }
 
 function materializeVisibleBlocksForScroll(view) {
+    return timeVirtual(view, 'scroll.total', () => materializeVisibleBlocksForScrollInner(view));
+}
+
+function materializeVisibleBlocksForScrollInner(view) {
     let state = ensureVirtualization(view);
     if (!state || state.activationPending || !hasUsableLayout(view))
         return false;
-    let visibleRange = findVirtualRange(view, 0);
-    let targetRange = findVirtualRange(view, state.options.overscanPx);
+    // Measuring the range costs a layout read per binary-search step. Within
+    // one scroll burst the viewport is fixed, so the first frame's range is
+    // reused by the continuation frames instead of re-reading every block.
+    let visibleRange = state.scrollRange && state.scrollRange.visible;
+    let targetRange = state.scrollRange && state.scrollRange.target;
+    if (!visibleRange || !targetRange) {
+        visibleRange = timeVirtual(view, 'scroll.findVisibleRange', () => findVirtualRange(view, 0));
+        targetRange = timeVirtual(view, 'scroll.findTargetRange', () => findVirtualRange(view, state.options.overscanPx));
+        state.scrollRange = { visible: visibleRange, target: targetRange };
+    }
     if (!targetRange || targetRange.end <= targetRange.start)
         return false;
 
+    let anchor = !view.composing ? captureVirtualAnchor(view, visibleRange) : null;
+    try {
+        return materializeVisibleBlocksForScrollBatch(view, state, visibleRange, targetRange, anchor);
+    }
+    finally {
+        commitVirtualHeights(view);
+        if (anchor)
+            restoreVirtualAnchor(view, anchor);
+    }
+}
+
+function materializeVisibleBlocksForScrollBatch(view, state, visibleRange, targetRange, anchor) {
+    // Cleanup runs at the start of the next frame: the height writes that
+    // compensated this frame's materialization must be committed before the
+    // stale blocks turn back into placeholders.
+    if (state.scrollCleanupPending) {
+        dematerializeRealDescs(view, state, { keepSelection: true });
+        state.scrollCleanupPending = false;
+    }
     let hasPending = range => {
         for (let index = range.start; index < range.end; index++) {
             let desc = state.topLevelDescs[index];
@@ -146,20 +241,8 @@ function materializeVisibleBlocksForScroll(view) {
         return false;
     };
     let pending = hasPending(targetRange);
-    let stale = hasStaleRealDescs(view, state, { keepSelection: true });
-
-    // Cleanup gets its own frame. Combining a cleanup batch with
-    // materialization would put both costs in the same callback.
-    if (state.scrollCleanupPending && stale) {
-        dematerializeRealDescs(view, state, { keepSelection: true });
-        state.scrollCleanupPending = false;
-        return pending;
-    }
-    if (!pending) {
-        if (stale)
-            dematerializeRealDescs(view, state, { keepSelection: true });
+    if (!pending)
         return false;
-    }
 
     let candidates = [], seen = new Set;
     let addIndex = index => {
@@ -182,14 +265,16 @@ function materializeVisibleBlocksForScroll(view) {
     let start = performance.now();
     let deadline = start + SCROLL_MATERIALIZATION_BUDGET_MS;
     let materialized = 0;
-    for (let desc of candidates) {
+    // One call per small group: the read, write and commit phases amortize
+    // over the group, so the per-desc planning cost stays out of the budget.
+    for (let offset = 0; offset < candidates.length && materialized < SCROLL_MATERIALIZATION_MAX_PER_FRAME;) {
         if (materialized && performance.now() >= deadline)
             break;
-        if (!materializeVirtualDescs(view, [desc]).length)
-            continue;
-        materialized++;
-        if (performance.now() >= deadline)
-            break;
+        let group = candidates.slice(offset, offset + Math.min(SCROLL_BATCH_SIZE, SCROLL_MATERIALIZATION_MAX_PER_FRAME - materialized));
+        offset += group.length;
+        let done = timeVirtual(view, 'scroll.materializeCall',
+            () => materializeVirtualDescs(view, group, { anchor, deferHeightCommit: true })).length;
+        materialized += done;
     }
 
     // The range describes the blocks that are real now. A pending overscan
@@ -207,13 +292,18 @@ function materializeVisibleBlocksForScroll(view) {
         state.range = { start: rangeStart, end: rangeEnd };
     state.topLevelChanged = false;
 
+    // Scan for stale blocks after the range update: the old range makes
+    // blocks we just scrolled past look fresh and they would never be torn
+    // down. Dematerialization is deferred to the next frame so it cannot
+    // disturb the height writes committed for the blocks just materialized.
+    state.scrollCleanupPending = timeVirtual(view, 'scroll.staleScan',
+        () => hasStaleRealDescs(view, state, { keepSelection: true }));
+
     pending = hasPending(targetRange);
-    stale = hasStaleRealDescs(view, state, { keepSelection: true });
-    state.scrollCleanupPending = stale;
-    return pending ? materialized > 0 || stale : stale;
+    return (pending && materialized > 0) || state.scrollCleanupPending;
 }
 
-export function materializeVisibleBlocks(view) {
+export function materializeVisibleBlocks(view, options) {
     let state = ensureVirtualization(view);
     if (!state)
         return;
@@ -227,7 +317,7 @@ export function materializeVisibleBlocks(view) {
                 if (desc && desc.virtual)
                     descs.push(desc);
             }
-            if (!descs.length || !materializeVirtualDescs(view, descs).length)
+            if (!descs.length || !materializeVirtualDescs(view, descs, options).length)
                 break;
         }
     }
@@ -235,7 +325,7 @@ export function materializeVisibleBlocks(view) {
     // edit would have to tear them down and lay them out again. This also
     // runs without a layout: the range of the last pass is enough to know
     // which blocks are outside of it.
-    dematerializeRealDescs(view, state, { keepSelection: true });
+    dematerializeRealDescs(view, state, { keepSelection: true, anchor: options && options.anchor });
     state.topLevelChanged = false;
 }
 
@@ -261,19 +351,27 @@ export function activateVirtualization(view) {
         cancelAnimationFrame(state.activationRaf);
         state.activationRaf = null;
     }
-    for (let desc of state.topLevelDescs)
-        if (desc && !desc.virtual) calibrateNodeHeight(view, desc);
-    // Calibration can improve the estimates of the blocks that are still
-    // placeholders. The height before materialization is captured after that
-    // correction, so the estimate is not immediately taken back by the
-    // compensation below.
-    let scrollHeightBefore = virtualScrollHeight(view);
-    let range = hasUsableLayout(view)
+    let usableLayout = hasUsableLayout(view);
+    let range = usableLayout
         ? findVirtualRange(view, state.options.overscanPx)
         : virtualRangeForDescs(view, state.topLevelDescs, state.options.overscanPx);
     state.range = range;
-    materializeSelectionBlocks(view, true);
-    materializeVisibleBlocks(view);
+    let anchor = !view.composing && usableLayout ? captureVirtualAnchor(view) : null;
+    for (let desc of state.topLevelDescs)
+        if (desc && !desc.virtual) calibrateNodeHeight(view, desc);
+    commitVirtualHeights(view);
+    if (anchor)
+        restoreVirtualAnchor(view, anchor);
+    let scrollHeightBefore = virtualScrollHeight(view);
+    try {
+        materializeSelectionBlocks(view, true, { anchor });
+        materializeVisibleBlocks(view, { anchor });
+    }
+    finally {
+        commitVirtualHeights(view);
+        if (anchor)
+            restoreVirtualAnchor(view, anchor);
+    }
     let scrollHeightDelta = virtualScrollHeight(view) - scrollHeightBefore;
     if (scrollHeightDelta) {
         let anchor = captureVirtualAnchor(view);
@@ -308,14 +406,35 @@ export function prepareVirtualUpdate(view, prev, state) {
     let virtualState = ensureVirtualization(view);
     let selectionChanged = !state.selection.eq(prev.selection);
     let deferSelection = !!(virtualState && virtualState.activationPending && !selectionChanged);
-    return { virtualState, selectionChanged, deferSelection };
+    // One anchor per dispatch: the read happens before any DOM write of this
+    // transaction, and the single restore at its end keeps the scroll position
+    // without a second forced layout.
+    let anchor = virtualState && !view.composing && hasUsableLayout(view)
+        ? captureVirtualAnchor(view)
+        : null;
+    // The reconciler runs inside the same dispatch and reuses this anchor.
+    view._virtualDispatchAnchor = anchor;
+    view._virtualAnchorRestored = false;
+    view._virtualMeasurementsReadInDispatch = false;
+    return { virtualState, selectionChanged, deferSelection, anchor };
 }
 
 export function materializeForSelection(view, update) {
     if (update.deferSelection)
         return;
-    materializeSelectionBlocks(view, update.selectionChanged);
-    let state = update.virtualState;
-    if (state && state.topLevelChanged && !state.activationPending)
-        materializeVisibleBlocks(view);
+    let anchor = update.anchor;
+    try {
+        materializeSelectionBlocks(view, update.selectionChanged, { anchor });
+        let state = update.virtualState;
+        if (state && state.topLevelChanged && !state.activationPending)
+            materializeVisibleBlocks(view, { anchor });
+    }
+    finally {
+        commitVirtualHeights(view);
+        if (anchor)
+            restoreVirtualAnchor(view, anchor);
+        view._virtualDispatchAnchor = undefined;
+        view._virtualAnchorRestored = false;
+        view._virtualMeasurementsReadInDispatch = false;
+    }
 }

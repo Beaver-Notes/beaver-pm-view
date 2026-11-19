@@ -15,6 +15,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Decoration, DecorationSet, EditorView, __findVirtualRange } from '../src/index.js';
 import { DEFAULT_TABLE_ROW_HEIGHT } from '../src/virtualize/constants.js';
 import { calibrateNodeHeight, estimateAccuracyReport, estimateNodeHeight } from '../src/virtualize/heights.js';
+import * as virtualHeights from '../src/virtualize/heights.js';
 import { dematerializeRealDescs, materializeVirtualDescs } from '../src/virtualize/materialize.js';
 
 const schema = new Schema({
@@ -405,6 +406,79 @@ describe('top-level virtualization', () => {
 
     view.destroy();
     place.remove();
+  });
+
+  it('reuses a standard block placeholder DOM across materialization', () => {
+    const { doc, place, view } = makeView(10, undefined, { threshold: 0, overscanPx: 0 });
+    const state = view._virtualization;
+    const index = state.topLevelDescs.findIndex(desc => desc && desc.virtual);
+    const virtualDesc = state.topLevelDescs[index];
+    const dom = virtualDesc.dom;
+    const placeholderHeight = dom.style.height;
+
+    expect(virtualDesc.virtual).toBe(true);
+    expect(dom.nodeName).toBe('P');
+
+    materializeVirtualDescs(view, [virtualDesc]);
+    const realDesc = state.topLevelDescs[index];
+    expect(realDesc.dom).toBe(dom);
+    expect(view.dom.children[index]).toBe(dom);
+    expect(dom.dataset.pmVirtual).toBeUndefined();
+    expect(dom.textContent).toBe(doc.child(index).textContent);
+
+    dematerializeRealDescs(view, state, { keepSelection: false });
+    const restoredDesc = state.topLevelDescs[index];
+    expect(restoredDesc.dom).toBe(dom);
+    expect(view.dom.children[index]).toBe(dom);
+    expect(dom.dataset.pmVirtual).toBe('true');
+    expect(dom.style.height).toBe(placeholderHeight);
+    expect(dom.textContent).toBe('');
+
+    view.destroy();
+    place.remove();
+  });
+
+  it('defers a new block measurement until after the write phase', () => {
+    const { place, view } = makeView(10, undefined, { threshold: 0, overscanPx: 0 });
+    const state = view._virtualization;
+    // Deferral applies to scroll frames: a direct materialization measures in
+    // the same frame so callers such as calibration see the result immediately.
+    state.inScrollFrame = true;
+    const virtualDesc = state.topLevelDescs.find(desc => desc && desc.virtual);
+    const dom = virtualDesc.dom;
+    const events = [];
+    const originalSetAttribute = dom.setAttribute;
+    const originalRemoveAttribute = dom.removeAttribute;
+    const originalRect = dom.getBoundingClientRect;
+
+    dom.setAttribute = function(...args) {
+      events.push('write');
+      return originalSetAttribute.apply(this, args);
+    };
+    dom.removeAttribute = function(...args) {
+      events.push('write');
+      return originalRemoveAttribute.apply(this, args);
+    };
+    dom.getBoundingClientRect = function(...args) {
+      events.push('read');
+      return originalRect.apply(this, args);
+    };
+
+    try {
+      materializeVirtualDescs(view, [virtualDesc]);
+
+      const firstWrite = events.indexOf('write');
+      expect(firstWrite).toBeGreaterThanOrEqual(0);
+      expect(events.slice(firstWrite)).not.toContain('read');
+      expect(state.pendingVirtualMeasurements || []).toHaveLength(1);
+    }
+    finally {
+      dom.setAttribute = originalSetAttribute;
+      dom.removeAttribute = originalRemoveAttribute;
+      dom.getBoundingClientRect = originalRect;
+      view.destroy();
+      place.remove();
+    }
   });
 
   it('restores the model selection after a placeholder swap', () => {
@@ -1144,7 +1218,6 @@ describe('top-level virtualization', () => {
       const undoMs = performance.now() - undoStart;
       const undoForced = forcedLayouts();
       const undoEqCalls = dispatchEqCalls;
-
       expect(undoMs).toBeLessThan(150);
       expect(updateMs).toBeLessThan(150);
       expect(undoEqCalls).toBeLessThan(materialized * 10);
@@ -1593,6 +1666,38 @@ describe('top-level virtualization', () => {
     }
   });
 
+  it('batches calibrated placeholder heights until an explicit commit', () => {
+    const state = {
+      calibration: new Map(),
+      heights: new WeakMap(),
+      estimates: new WeakMap(),
+      heightAdjustments: new WeakMap(),
+      tableRowSamples: [],
+      topLevelDescs: [],
+      width: 800,
+    };
+    const view = { _virtualization: state, dom: { clientWidth: 800 } };
+    const placeholderNode = schema.nodes.paragraph.create(null, schema.text('x'.repeat(110)));
+    const placeholder = document.createElement('div');
+    placeholder.style.height = '300px';
+    state.topLevelDescs.push({ node: placeholderNode, dom: placeholder, virtual: true, estimatedHeight: 300 });
+
+    const measuredNode = schema.nodes.paragraph.create(null, schema.text('x'.repeat(40)));
+    const measuredDOM = document.createElement('p');
+    measuredDOM.textContent = measuredNode.textContent;
+    measuredDOM.getBoundingClientRect = () => ({ height: 25.56 });
+    state.heights.set(measuredNode, 25.56);
+
+    calibrateNodeHeight(view, { node: measuredNode, dom: measuredDOM, virtual: false });
+
+    expect(placeholder.style.height).toBe('300px');
+    expect(state.pendingVirtualHeightWrites).toHaveLength(1);
+    expect(virtualHeights.commitVirtualHeights).toBeTypeOf('function');
+    virtualHeights.commitVirtualHeights(view);
+    expect(placeholder.style.height).not.toBe('300px');
+    expect(state.pendingVirtualHeightWrites).toHaveLength(0);
+  });
+
   it('defers heavy mount activation without changing the activated state', async () => {
     const originalRect = HTMLElement.prototype.getBoundingClientRect;
     const originalRaf = globalThis.requestAnimationFrame;
@@ -1925,7 +2030,9 @@ describe('top-level virtualization', () => {
       expect(view._virtualization.range.end).toBeLessThanOrEqual(100);
       expect(placeholders).toBeGreaterThan(2900);
       expect(real).toBeLessThanOrEqual(60);
-      expect(view.dom.querySelectorAll('p').length).toBeLessThanOrEqual(60);
+      // Semantic placeholders reuse the node's own tag, so count only the
+      // real paragraphs: virtual ones carry data-pm-virtual="true".
+      expect(view.dom.querySelectorAll('p:not([data-pm-virtual])').length).toBeLessThanOrEqual(60);
     }
     finally {
       undoManager.destroy();

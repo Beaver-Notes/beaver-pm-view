@@ -20,6 +20,10 @@ export const DEFAULT_CODE_PADDING = 36;
 export const DEFAULT_CODE_MARGIN = 25.56;
 export const MIN_CALIBRATION_TEXT_LENGTH = 40;
 export const SCROLL_MATERIALIZATION_BUDGET_MS = 8;
+export const SCROLL_BATCH_SIZE = 2;
+// Even when materialization is cheap enough to fit the time budget, leave
+// overscan work for a later frame so one scroll never consumes the whole band.
+export const SCROLL_MATERIALIZATION_MAX_PER_FRAME = 8;
 
 // Above this many replaced top-level blocks the change is a bulk rewrite, not
 // a local edit, and the virtualized reconciler is cheaper than the generic
