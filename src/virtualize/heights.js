@@ -232,20 +232,53 @@ function refreshVirtualEstimates(view, state, key) {
     let children = state.topLevelDescs;
     if (!children)
         return;
-    let start = performance.now(), changed = 0;
+    let start = performance.now();
     let pending = state.pendingVirtualHeightWrites || (state.pendingVirtualHeightWrites = []);
+    let updated = [], delta = 0;
     for (let desc of children) {
         if (!desc || !desc.virtual || !desc.node || virtualCalibrationKey(desc.node) != key)
             continue;
         if (!state.heights.get(desc.node))
             state.estimates.set(desc.node, estimateNodeHeight(view, desc.node));
         let height = virtualHeight(view, desc.node);
-        desc.estimatedHeight = height;
-        pending.push({ desc, height, margins: virtualMargins(state, desc.node) });
-        changed++;
+        let margins = virtualMargins(state, desc.node);
+        // Re-estimating every placeholder of a type moves the whole document
+        // in one frame. Keep the flow total fixed so the content under the
+        // cursor does not jump while calibration is converging.
+        if (desc.dom) {
+            let top = margins ? margins.top || 0 : 0, bottom = margins ? margins.bottom || 0 : 0;
+            let oldFlow = (Number.parseFloat(desc.dom.style.height) || 0) +
+                Math.max(Number.parseFloat(desc.dom.style.marginTop) || 0,
+                    Number.parseFloat(desc.dom.style.marginBottom) || 0);
+            delta += height + Math.max(top, bottom) - oldFlow;
+        }
+        let write = { desc, height, margins };
+        updated.push(write);
+        pending.push(write);
     }
+    let scrollBand = state.scrollCompensationRange || state.scrollRange && state.scrollRange.visible;
+    if (delta && updated.length > 1 && scrollBand) {
+        let candidates = updated.filter(write => {
+            let index = write.desc.topLevelIndex;
+            return !(index >= scrollBand.start && index < scrollBand.end);
+        });
+        if (candidates.length) {
+            let per = -delta / candidates.length;
+            for (let write of candidates) {
+                let next = Math.max(0, write.height + per);
+                let change = next - write.height;
+                if (!change)
+                    continue;
+                write.height = next;
+                let node = write.desc.node;
+                state.heightAdjustments.set(node, (state.heightAdjustments.get(node) || 0) + change);
+            }
+        }
+    }
+    for (let write of updated)
+        write.desc.estimatedHeight = write.height;
     recordVirtual(view, 'heights.refreshVirtualEstimates', performance.now() - start);
-    recordVirtual(view, 'heights.refreshVirtualEstimates.blocks', changed);
+    recordVirtual(view, 'heights.refreshVirtualEstimates.blocks', updated.length);
 }
 
 export function commitVirtualHeights(view) {

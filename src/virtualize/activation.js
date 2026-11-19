@@ -46,13 +46,15 @@ function attachVirtualScroll(view, state) {
 
 function scheduleVirtualScroll(view, continuation = false) {
     let state = view._virtualization;
-    if (!state || state.scrollRaf != null)
+    if (!state)
         return;
-    // A new scroll burst means the viewport moved: the cached range from the
-    // previous burst no longer describes what the user can see. Continuation
+    // A new scroll event moves the viewport even while a rAF is pending, so
+    // the cached range is stale by the time that frame runs. Continuation
     // frames finish work inside the same burst and keep the measured range.
     if (!continuation)
         state.scrollRange = null;
+    if (state.scrollRaf != null)
+        return;
     let token = state.scrollToken = {};
     let raf = requestAnimationFrame(() => {
         if (state.scrollToken !== token)
@@ -265,12 +267,16 @@ function materializeVisibleBlocksForScrollBatch(view, state, visibleRange, targe
     let start = performance.now();
     let deadline = start + SCROLL_MATERIALIZATION_BUDGET_MS;
     let materialized = 0;
+    // The cap exists to defer overscan, not to leave the blocks the user can
+    // actually see as placeholders for another frame. Cover the whole visible
+    // slice in one frame; the time budget still bounds the work.
+    let maxPerFrame = Math.max(SCROLL_MATERIALIZATION_MAX_PER_FRAME, visibleRange.end - visibleRange.start);
     // One call per small group: the read, write and commit phases amortize
     // over the group, so the per-desc planning cost stays out of the budget.
-    for (let offset = 0; offset < candidates.length && materialized < SCROLL_MATERIALIZATION_MAX_PER_FRAME;) {
+    for (let offset = 0; offset < candidates.length && materialized < maxPerFrame;) {
         if (materialized && performance.now() >= deadline)
             break;
-        let group = candidates.slice(offset, offset + Math.min(SCROLL_BATCH_SIZE, SCROLL_MATERIALIZATION_MAX_PER_FRAME - materialized));
+        let group = candidates.slice(offset, offset + Math.min(SCROLL_BATCH_SIZE, maxPerFrame - materialized));
         offset += group.length;
         let done = timeVirtual(view, 'scroll.materializeCall',
             () => materializeVirtualDescs(view, group, { anchor, deferHeightCommit: true })).length;

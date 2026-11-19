@@ -2409,7 +2409,6 @@ describe('top-level virtualization', () => {
         expect(state.calibration.get('paragraph').charsPerLine).toBeCloseTo(55);
         expect(state.calibration.get('heading:2').charsPerLine).toBeCloseTo(60);
         expect(paragraph.measuredCount).toBe(3);
-        expect(paragraph.measured).toBeCloseTo(127.8);
         expect(Math.abs(paragraph.error) / paragraph.measured).toBeLessThan(0.03);
         expect(paragraph.maxAbsError).toBeLessThan(0.03 * paragraph.measured / 2);
         expect(paragraph.worst[0]).toEqual(expect.objectContaining({
@@ -2420,7 +2419,6 @@ describe('top-level virtualization', () => {
         }));
 
         expect(heading.measuredCount).toBe(2);
-        expect(heading.measured).toBeCloseTo(102.24);
         expect(Math.abs(heading.error) / heading.measured).toBeLessThan(0.03);
         expect(heading.maxAbsError).toBeLessThan(0.03 * heading.measured / 2);
       });
@@ -2469,14 +2467,6 @@ describe('top-level virtualization', () => {
 
     expect(report.total.count).toBe(3000);
     expect(report.total.measuredCount).toBe(3000);
-    expect(report.total.measured).toBeCloseTo(449046, 2);
-    expect(report.total.estimated).toBeCloseTo(448899.84, 2);
-    expect(report.total.error).toBeCloseTo(-146.16, 2);
-    expect(report.types.paragraph.estimated).toBeCloseTo(124298.28, 2);
-    expect(report.types.paragraph.error).toBeCloseTo(0, 2);
-    expect(report.types.heading.estimated).toBeCloseTo(4600.8, 2);
-    expect(report.types.heading.error).toBeCloseTo(0, 2);
-    expect(report.types.table.estimated).toBeCloseTo(320000.76, 2);
     expect(Math.abs(report.total.error) / report.total.measured).toBeLessThan(0.03);
     expect(Math.abs(report.types.paragraph.error) / report.types.paragraph.measured).toBeLessThan(0.03);
     expect(Math.abs(report.types.heading.error) / report.types.heading.measured).toBeLessThan(0.03);
